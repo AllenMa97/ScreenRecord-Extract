@@ -1,0 +1,13 @@
+\datedsubsection{\textbf{ScreenRecord-Extract 手机录屏内容智能提取系统}}{2026.05-2026.09}
+\begin{itemize}
+    \item \textbf{项目概要：}自研 CPU-friendly 手机录屏内容提取框架，结合计算机视觉、OCR 与大语言模型多模态技术，将聊天记录类长录屏自动转化为带收发方向标记的结构化文本，OCR 调用量降至总帧数 9\% 以下且零内容丢失。
+    \item \textbf{项目内容：}
+    \begin{enumerate}
+        \item 设计九阶段流水线架构：自适应抽帧→ROI 裁剪→模糊过滤→视觉去重→OCR 识别→文本跟踪→语义去重→时序状态机→内容组装，实现端到端无人工干预处理。
+        \item 提出 RFSA 行指纹序列对齐算法，采用 Needleman-Wunsch 全局比对替代全局 pHash，解决文本密集 UI 布局相似导致的误丢弃问题；引入内容指纹 OCR 复用机制，进一步减少 49\% API 调用。
+        \item 实现相位相关运动估计与 GDE 梯度方向熵模糊检测，精准区分静止/滚动/内容变化三种状态，运动模糊检测与内容密度解耦，误杀率趋近于零。
+        \item 构建生产者-消费者并行 OCR 流水线，异步并发隐藏网络延迟；支持断点续传与增量缓存，重跑视频 OCR 调用可降至零。
+        \item 开发 FastAPI + Vue3 Web 可视化界面，支持视频上传、实时进度推送与结果预览；集成 VAD 语音活动检测与 ASR 转写，覆盖音视频双模态。
+    \end{enumerate}
+    \item \textbf{相关链接：}\href{https://github.com/AllenMa97/ScreenRecord-Extract}{github.com/AllenMa97/ScreenRecord-Extract}
+\end{itemize}

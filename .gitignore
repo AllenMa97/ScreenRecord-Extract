@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Output and cache
+output/
+*.log
+*.jsonl
+output/cache/
+
+# Videos (large files)
+videos/
+*.mp4
+*.mov
+*.avi
+
+# Ground truth data
+ground_truth/
+
+# Test assets (large)
+tests/avatars/
+
+# Node modules
+web/frontend/node_modules/
+web/frontend/dist/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Config with secrets
+config.yaml
+config.local.yaml
+
+# Env files
+.env
+.env.local

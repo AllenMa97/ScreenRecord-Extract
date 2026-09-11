@@ -1,0 +1,16 @@
+# 前端依赖与构建产物 / frontend deps & build output
+node_modules/
+dist/
+.vite/
+
+# 上传的视频与会话数据 / uploaded videos & session data
+videos/
+
+# Python 缓存 / python cache
+__pycache__/
+*.pyc
+
+# 编辑器 / editors
+.idea/
+.vscode/
+*.swp

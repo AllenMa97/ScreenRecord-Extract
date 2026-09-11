@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn>=0.29
+# WebSocket 支持: uvicorn 处理升级请求必需 / required for WebSocket upgrades
+websockets>=12.0
+python-multipart>=0.0.9
+# 算法流水线依赖(已有) / algorithm deps (already present)
+# opencv-python, numpy, pyyaml, requests

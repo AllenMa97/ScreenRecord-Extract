@@ -1,0 +1,170 @@
+# ==============================================================================
+# 手机录屏内容提取 - 配置文件示例 / Screen Recorder Content Extraction - Config Example
+# ==============================================================================
+# 复制本文件为 config.yaml 并填入你的配置 / Copy this file to config.yaml and fill in your config
+
+video:
+  input_path: "videos"              # 视频输入路径(文件或目录) / Video input path (file or dir)
+
+audio:
+  # 音频侧: 提取视频音轨 → VAD切段 → 语音转文字(带视频时间轴锚点)
+  # Audio side: extract track → VAD → STT (video-time anchored).
+  enabled: true
+  base_url: "http://your-asr-server:port/v1"   # ASR服务地址 / ASR service URL
+  api_key: "your_api_key_here"                 # API密钥 / API key
+  model: "sensevoice-small"                    # ASR模型名 / ASR model name
+  sample_rate: 16000
+  max_segment_seconds: 360
+  concurrency: 2
+  bubble_enabled: true
+  bubble_threshold: 0.55
+  bubble_sample_interval_s: 0.2
+  bubble_merge_window_s: 1.2
+  match_gap_s: 1.5
+  inject_chat: true
+
+sampling:
+  static_floor: 2.0
+  adapt_window: 120
+  static_percentile: 30
+  active_percentile: 75
+  static_confirm_seconds: 0.25
+  max_step_seconds: 1.0
+  compute_width: 240
+  compute_height: 180
+  scroll_min_interval_seconds: 0.12
+  t1_cap_ratio: 3.0
+  settle_suppress_seconds: 0.4
+  frame_value_enabled: true
+  value_high_threshold: 0.5
+  value_strip_count: 8
+  value_max_shift: 60
+  value_shift_tol: 8
+  value_peak_replace: 0.5
+  value_strip_mae_threshold: 6.0
+  value_gde_min: 2.6
+  value_fallback_interval: 0.12
+  value_fallback_min_novelty: 0.75
+  value_fallback_overlap_high: 0.6
+  value_fallback_novelty_max: 1.0
+  value_scroll_break_novelty: 0.75
+  settle_skip_interval: 0.5
+  scroll_guard_interval: 0.7
+  scroll_guard_min_novelty: 0.35
+  scroll_guard_max_dy: 2.0
+  pc_enabled: true
+  peak_motion: 0.3
+  dy_scroll_px: 1.0
+
+roi:
+  margin_top: 60
+  margin_bottom: 120
+  margin_left: 0
+  margin_right: 0
+  recheck_interval: 5.0
+  adaptive: true
+  compute_width: 160
+  noise_floor: 2.0
+  activity_ratio_min: 0.05
+  min_content_ratio: 0.3
+  pad_rows: 8
+
+blur:
+  window_size: 10
+  blur_ratio: 0.2
+  min_absolute_score: 6.0
+  compute_width: 480
+  gde_bins: 36
+  gde_floor: 2.6
+  gde_weak_ratio: 0.1
+  unlock_consecutive: 5
+  stale_seconds: 8.0
+  ewma_alpha: 0.2
+
+visual_dedup:
+  strip_count: 8
+  dhash_size: 8
+  strip_distance_threshold: 5
+  changed_strip_ratio: 0.5
+  diff_duplicate_threshold: 300
+  diff_new_content_threshold: 3000
+  dedup_send_min_mae: 1.0
+  compute_width: 160
+  content_reuse_max_hd: 12
+  dup_tight_ratio: 0.5
+  new_loose_ratio: 0.6
+  calibration_enabled: true
+  calibration_rate: 0.1
+  calibration_min_dup: 50.0
+  calibration_max_new: 10000.0
+  rf_enabled: true
+  rf_phase_enabled: true
+  rf_strip_height: 16
+  rf_dhash_size: 8
+  rf_gap_penalty: -0.3
+  rf_match_floor: 0.85
+  rf_dup_ratio: 0.8
+  rf_new_ratio: 0.4
+  rf_noise_floor: 14
+  rf_history_len: 3
+  rf_rigid_roll_ratio: 0.7
+  rf_rigid_over_ratio: 0.5
+  rf_lib_enabled: true
+  rf_lib_max: 2000
+  rf_lib_match_hd: 6
+
+ocr:
+  mode: "api"                       # "api" / "local" / "mock"
+  api_endpoint: "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+  api_key: "your_aistudio_token_here"   # AI Studio访问令牌 / AI Studio access token
+  model: "PP-OCRv6"
+  poll_interval: 5
+  concurrent: 4
+  cache_persist_mock: false
+  lang: "ch"
+  timeout: 30
+  scroll_confidence_threshold: 0.65
+
+text_tracker:
+  iou_threshold: 0.4
+  text_sim_threshold: 0.80
+  line_expire_seconds: 3.0
+  voting_window: 5
+  center_distance_ratio: 0.15
+
+state_machine:
+  min_text_lines: 3
+  suspend_confirm_frames: 3
+  density_ratio_threshold: 0.3
+  overlap_threshold: 0.25
+  gap_overlap_threshold: 0.15
+
+llm:
+  enabled: true
+  api_endpoint: "https://api.deepseek.com/v1/chat/completions"
+  api_key: "your_llm_api_key_here"
+  model: "deepseek-chat"
+  timeout: 60
+  thinking: false
+  text_dup_threshold: 0.92
+  text_new_threshold: 0.60
+  ocr_correction_confidence: 0.5
+
+calibration:
+  enabled: true
+  min_frames: 45
+  max_frames: 150
+  blur_floor_pct: 5
+  dedup_dup_pct: 50
+  dedup_new_pct: 50
+
+output:
+  dir: "output"
+  save_frames: true
+  save_log: true
+  log_file: "behavior_log.jsonl"
+  chat_format:
+    enabled: true
+    roi_width: 0
+    center_margin: 20
+    time_fallback: true
