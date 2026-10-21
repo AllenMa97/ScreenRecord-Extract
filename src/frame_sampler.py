@@ -86,6 +86,11 @@ class FrameSampler:
         # frame_id(采样序号)与视频帧位置不再一一对应, 随机读帧时必须按此换算,
         # 否则会读到完全不同时刻的画面(气泡像素验证/收发色判定全部失真)。
         self._id_to_video: dict = {}
+        # 采样帧序号 -> 该帧裁图实际用的 ROI 盒(x, y, w, h)。自适应 ROI 会在预热
+        # 结束时改变(实测 `(0,60,576,1100)` → `(0,302,576,808)`), 而 OCR 行的
+        # bbox 是**裁图当时**那一版 ROI 的局部坐标; 随机读帧若一律用终版 ROI 裁,
+        # 预热期帧的 bbox 会整体错位 242px(甚至越界), 任何依赖 y 的像素判据失效。
+        self._roi_history: dict = {}
         # 帧间变化速度历史(自适应窗口)
         self._velocity_window: deque = deque(maxlen=self._adapt_window)
         self._prev_gray_small: Optional[np.ndarray] = None
@@ -145,6 +150,10 @@ class FrameSampler:
         注意: 参数是**采样帧序号**(FrameData.frame_id), 不是视频帧序号。
         快进采样会跳帧, 两者不相等, 必须先经 `_id_to_video` 换算再seek, 否则
         读到的将是另一时刻的画面, 使气泡像素验证/收发色判定失效。
+
+        裁剪用**该帧当时**的 ROI(见 `_roi_history`), 不是终版 ROI: 自适应 ROI
+        在预热结束时会挪原点/改高度, 而跟踪行携带的 bbox 是裁图当时那一版 ROI
+        的局部坐标, 用终版 ROI 裁会让预热期帧的 bbox 整体错位甚至越界。
         """
         if self._cap is None or not self._cap.isOpened():
             return None
@@ -155,7 +164,7 @@ class FrameSampler:
         ok, frame = self._cap.read()
         if not ok or frame is None:
             return None
-        return self._get_roi_frame(frame)
+        return self._get_roi_frame(frame, self._roi_history.get(frame_id))
 
     def _compute_roi_gray_small(self, frame: np.ndarray) -> np.ndarray:
         """裁剪ROI并降采样为灰度图"""
@@ -164,9 +173,11 @@ class FrameSampler:
         gray = to_gray(roi)
         return resize_frame(gray, self._compute_w, self._compute_h)
 
-    def _get_roi_frame(self, frame: np.ndarray) -> np.ndarray:
-        """获取ROI裁剪帧(原始分辨率)"""
-        x, y, w, h = self._roi_box
+    def _get_roi_frame(self, frame: np.ndarray,
+                       box: Optional[Tuple[int, int, int, int]] = None
+                       ) -> np.ndarray:
+        """获取ROI裁剪帧(原始分辨率)。box 缺省用当前 ROI。"""
+        x, y, w, h = box or self._roi_box
         return frame[y:y + h, x:x + w].copy()
 
     @staticmethod
@@ -353,6 +364,7 @@ class FrameSampler:
         roi_frame = self._get_roi_frame(frame)
         self._frame_id_counter += 1
         self._id_to_video[self._frame_id_counter] = self._frame_idx
+        self._roi_history[self._frame_id_counter] = tuple(self._roi_box)
 
         pc_state = self._classify_pc_state(self._pc_last_peak, self._pc_last_dy)
         self._logger.log("frame_sampler", "sample",

@@ -435,6 +435,236 @@ def drop_system_prompts(lines: List[TrackedLine], roi_width: int,
     return kept, dropped
 
 
+# ---------------------------------------------------------------------------
+# App 界面装饰行过滤 / App UI-chrome filtering (CV 卡片区域检测)
+# ---------------------------------------------------------------------------
+# 真实录屏的聊天区里, 除了消息气泡还固定贴着 **App 自身的界面元素**: 顶部防诈骗
+# 横幅、运营卡片("上传真实头像即可获得5金币奖励"/"领取")、对方资料卡片("年龄：
+# 26岁"/"你们相距1km")、亲密度提示条、底部输入框引导文案("真诚的回复, 更能感受到
+# 你的真心~")。这些文字被 OCR 正常读出, 却既不是"收"也不是"发"的聊天内容 —— 一旦
+# 输出就是纯假阳性(实测 video4: 22 行里占 8 行, 精确率被压到 0.619)。
+#
+# 为什么不用文本黑名单: 每个 App、每次运营活动的措辞都不同, 枚举不完, 且容易误杀
+# 正文(用户完全可能在聊天里打出"领取""年龄：26岁")。因此改走 CV, 抓它们共同的
+# **形态**: 一块横向几乎铺满 ROI 的平坦色面板; 而消息气泡宽度 <= 0.6 ROI 且贴在
+# 左/右某一侧, 墙纸本身则不构成"贴出来的一块"(与外侧无台阶)。
+#
+# 判据(全部满足才滤, 保守取向 = 宁可漏滤也不错滤正文):
+#   1. 由文本行带向上/下两遍扩展(相邻行中位色平滑 + 与面板色同色)得到面板矩形;
+#      矩形不得铺满整帧(否则参考色就是墙纸本身), 高度也不得超过 _PANEL_MAX_H ×
+#      ROI 高 → 拦住"照片墙纸上凑出来的高假面板";
+#   2. 在**整块面板高度**上取列中位色, 与多数色同色的列占比 >= _PANEL_MIN_FLAT
+#      → 拦住"宽发送气泡"(气泡只占 ROI 宽的一部分, 气泡外的列是墙纸);
+#   3. **主判据**: 面板上/下边界外探 _PANEL_EDGE_PROBE 行的窗口里, 行中位色与面板
+#      色的最大色差 >= _PANEL_EDGE_MIN → 面板是从背景里"贴出来的一块"。照片墙纸
+#      上的真消息行也会因局部亮度渐变凑出一个"面板", 但它没有台阶(实测 video4:
+#      卡片/横幅/输入条台阶 131~238, 真消息行 36~58);
+#   4. 面板矩形内与面板色同色的像素占比 >= _PANEL_FLAT_RATIO
+#      → 排除整屏照片/截图(列中位色可能平坦, 矩形内却布满细节)。
+# 判据 1 与 2 各自拦一类实测假阳性, 缺一不可(标定见两常量的注释)。
+# 时间分隔条(STAMP_RE)一律不滤: 消息时间关联需要它们。判定在"首帧+末帧"这对
+# 位移最大的观测上取**全票一致**(装饰块静止, 真消息滚动), 任一帧否决即保留。
+# / Fixed app furniture (anti-fraud banner, promo/profile cards, intimacy strip,
+# input-box hint) is OCR'd exactly like chat text but is neither sent nor
+# received, so emitting it is pure false positive. Text blacklists can't
+# enumerate it (wording varies per app/campaign) and risk killing real bodies,
+# so we detect the shared visual shape instead: a flat panel spanning nearly the
+# whole ROI width. All four criteria must hold; #1 and #2 each rule out one
+# measured false-positive class (tall wallpaper pseudo-panel / wide send bubble)
+# that the edge step alone cannot. HH:MM/weekday dividers are never dropped.
+_PANEL_BAND_PAD = 4       # 行带上下外扩(px): 取面板填充色的采样带
+_PANEL_MIN_FLAT = 0.70    # 面板同色列占比下限(容忍卡内头像/按钮等非平坦元素)。
+                          # 实测界面卡片/横幅/输入条 0.75~0.98, 而**白色发送气泡**
+                          # 只有 0.61(气泡宽 / ROI 宽) —— 白气泡对白卡片时台阶、
+                          # 矩形内平坦度、与墙纸的色差全部失效, 这是唯一可分维度。
+                          # 阈值必须卡在两者之间, 定 0.60 会放行气泡。
+_PANEL_FLAT_TOL = 14      # "同色"判据: 与面板参考色的最大通道差。必须小于
+                          # "白气泡255 vs 浅墙纸237"的对比(18), 否则气泡与墙纸
+                          # 会被并成同一块面板, 真消息整片被误滤。
+_PANEL_SMOOTH = 10        # 面板垂直扩展(第一遍): 相邻行中位色突变超过此值即为面板
+                          # 边界。用"相邻行平滑"而非只用"与单一参考色同色", 才能
+                          # 吃掉**竖向渐变**的横幅(实测防诈骗横幅: 与参考色比只在
+                          # 文本行带内成立, 面板被截成 27 行高, 列中位全被字形带偏)。
+_PANEL_MAX_H = 0.25       # 面板高度上限(占 ROI 高度): 卡片/横幅/提示条都是矮块,
+                          # 聊天区本身(墙纸)高度远超此值。实测真装饰块 0.03~0.22,
+                          # 而照片墙纸上凑出的假面板 0.21~0.63。这类假面板若上边界
+                          # 正好紧贴一张真卡片, 台阶量到的是"墙纸 vs 卡片"(实测
+                          # video3 真消息「收到」ph=0.51 edge=130, 判据 3 拦不住),
+                          # 只有高度上限能拦住。定 0.55 会放行。
+_PANEL_SCAN = 260         # 面板垂直扩展的最大搜索距离(px, 上/下各一次)
+_PANEL_EDGE_PROBE = 24    # 边界外探多少行取外侧背景色(窗口, 取窗口内最大色差)。
+                          # 取窗口而非单行、且窗口要够宽, 因为界面块常是**叠层**
+                          # 的: 实测底部输入条 = 灰色带(y1038-1049)+白色输入框
+                          # (y1050+), 只探紧邻的 12 行会整段落在灰色带里(edge=29),
+                          # 探到 24 行才够到上方的深色聊天区(edge=172)。
+_PANEL_EDGE_MIN = 60      # 边界台阶最小色差: 这是**主判据**。实测界面卡片/横幅/
+                          # 输入条与外侧背景的台阶为 131~238, 而照片墙纸上的真消息
+                          # 行(局部亮度渐变造成的假面板)台阶只有 36~58。
+_PANEL_FLAT_RATIO = 0.50  # 面板矩形内同色像素占比下限(排除照片/截图)
+
+
+def _longest_run(mask) -> int:
+    """布尔序列里最长连续 True 段的长度。"""
+    best, cur = 0, 0
+    for v in mask:
+        cur = cur + 1 if v else 0
+        if cur > best:
+            best = cur
+    return best
+
+
+def _panel_probe(frame, bbox) -> Optional[dict]:
+    """量出该文本行所在"水平色块"(面板)的形态指标。判据与调试共用。
+
+    两遍法(先定垂直范围, 再量横向跨度): 直接在文本行带里取"每列中位色"会被
+    **字形**污染 —— 密集中文行的笔画能占到行带一半以上的行, 列中位落到字色上
+    (实测 video4 防诈骗横幅首行: 平坦列占比只有 0.66, 最长连续跨度只剩 0.06)。
+    改成先框出面板矩形(行中位抗字形污染; "相邻行平滑"+"与面板色同色"两遍扩展,
+    分别吃掉**竖向渐变**与面板内部的跳变行), 再在**整块面板高度**上取列中位,
+    字形占比被摊薄, 列背景色才干净。
+
+    返回 None 表示帧太小、或 bbox 落在帧外(坐标系不匹配)而无从判定。
+    """
+    h, w = frame.shape[:2]
+    if h < 16 or w < 16:
+        return None
+    _, y1, _, y2 = bbox
+    # bbox 整体落在帧外 = 坐标系不匹配(自适应ROI在预热结束时挪原点/改高度, 旧帧
+    # 的 bbox 是另一版 ROI 的局部坐标)。此时若照常 clamp, 会把"帧底最后一两行"
+    # 当成该文本行的面板并给出**自信的错误判定**(实测: 输入框引导文案 y=1064 越界
+    # 后被 clamp 到 808 高帧的底部, 连带把 y=967 的真消息一起判成卡片)。宁可放过。
+    if int(y2) < 0 or int(y1) > h - 1:
+        return None
+    by1 = max(0, min(h - 2, int(y1) - _PANEL_BAND_PAD))
+    by2 = max(by1 + 1, min(h, int(y2) + _PANEL_BAND_PAD))
+
+    wy1 = max(0, by1 - _PANEL_SCAN)
+    wy2 = min(h, by2 + _PANEL_SCAN)
+    row_med = np.median(frame[wy1:wy2].astype(np.int16), axis=1)   # (n,3)
+    jump = np.abs(np.diff(row_med, axis=0)).max(axis=1)            # (n-1,)
+    pt = by1 - wy1
+    while pt - 1 >= 0 and jump[pt - 1] <= _PANEL_SMOOTH:
+        pt -= 1
+    pb = by2 - 1 - wy1
+    while pb < jump.size and jump[pb] <= _PANEL_SMOOTH:
+        pb += 1
+
+    # 第二遍(同色扩展): 平滑扩展可能停在面板**内部**的渐变/圆角行上 —— 实测
+    # 底部输入条面板从 y=1038 起, 却在 1050 处因内部跳变停下, 外探窗口整段落在
+    # 白条里量不到台阶(edge 只有 29)。再按"行中位色与面板色同色"补一次扩展。
+    n_rows = row_med.shape[0]
+    ref0 = np.median(np.median(frame[wy1 + pt:wy1 + pb + 1].astype(np.int16),
+                               axis=0), axis=0)
+    while pt - 1 >= 0 and np.abs(row_med[pt - 1] - ref0).max() <= _PANEL_FLAT_TOL:
+        pt -= 1
+    while pb + 1 < n_rows and \
+            np.abs(row_med[pb + 1] - ref0).max() <= _PANEL_FLAT_TOL:
+        pb += 1
+    pt_abs, pb_abs = wy1 + pt, wy1 + pb
+
+    rect = frame[pt_abs:pb_abs + 1].astype(np.int16)
+    col_med = np.median(rect, axis=0)
+    ref = np.median(col_med, axis=0)
+    flat_col = np.abs(col_med - ref).max(axis=1) <= _PANEL_FLAT_TOL
+    edge = 0.0
+    for lo, hi in ((pt_abs - _PANEL_EDGE_PROBE, pt_abs - 1),
+                   (pb_abs + 1, pb_abs + _PANEL_EDGE_PROBE)):
+        lo, hi = max(0, lo), min(h - 1, hi)
+        if lo > hi:
+            continue                      # 面板贴到帧边, 该侧无外侧可比
+        band = np.median(frame[lo:hi + 1].astype(np.int16), axis=1)   # (n,3)
+        edge = max(edge, float(np.abs(band - ref).max()))
+    run_len = _longest_run(flat_col)
+    return {"h": h, "w": w, "pt": pt_abs, "pb": pb_abs,
+            "ref": ref,
+            "frac": float(flat_col.mean()),
+            "run": run_len / float(w),
+            "edge": edge,
+            "ratio": float((np.abs(rect - ref).max(axis=2)
+                            <= _PANEL_FLAT_TOL).mean())}
+
+
+def _ui_chrome_on_frame(fid: int, bbox, frame_provider) -> bool:
+    """单帧判定: 该文本行是否落在"整宽平坦面板"(= App 界面装饰块)上。
+
+    帧坐标说明: bbox 为 ROI 坐标, frame_provider 返回的也是 ROI 裁剪帧。
+    """
+    frame = frame_provider(fid)
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return False
+    p = _panel_probe(frame, bbox)
+    if p is None:
+        return False
+    h = p["h"]
+    if p["pt"] <= 0 and p["pb"] >= h - 1:
+        return False                # 铺满整帧 = 墙纸本身, 不是卡片
+    if (p["pb"] - p["pt"] + 1) > _PANEL_MAX_H * h:
+        return False                # 太高 = 整个聊天区, 不是卡片
+    if p["frac"] < _PANEL_MIN_FLAT:
+        return False                # 横向不够整宽平坦 = 气泡(只占一侧)
+    if p["edge"] < _PANEL_EDGE_MIN:
+        return False                # 与外侧背景无台阶 = 墙纸上的普通文字行
+    return p["ratio"] >= _PANEL_FLAT_RATIO
+
+
+def is_ui_chrome_line(line: TrackedLine, frame_provider,
+                      chat_enabled: bool = True) -> bool:
+    """该跟踪行是否为 App 界面装饰文案(横幅/运营卡片/资料卡片/输入框引导)。
+
+    换帧复判取**全票一致**: 界面装饰块是静止的, 首帧与末帧(位移最大的一对观测)
+    必然落在同一块面板上; 真消息会随滚动移动, 至多个别帧恰好滚进卡片区域。任一
+    候选帧判"非面板"即返回 False —— 宁可漏滤也不错滤正文。只有一个观测帧时无从
+    复判, 采信该帧。
+    / Unanimous vote across the max-displacement frame pair: furniture is static,
+    real messages scroll. Any non-panel frame vetoes the drop.
+    """
+    if not chat_enabled or frame_provider is None or line is None:
+        return False
+    t = (line.text or "").strip()
+    if not t or STAMP_RE.fullmatch(t):
+        return False                # 时间分隔条不滤(消息时间关联需要)
+    bbox = _pos(line)
+    if not bbox or len(bbox) < 4:
+        return False
+    candidates = [(line.first_seen_frame, bbox)]
+    if line.last_seen_frame != line.first_seen_frame:
+        candidates.append((line.last_seen_frame, line.bbox))
+    for o in reversed(list(getattr(line, "observations", None) or [])):
+        candidates.append((o.frame_id, o.bbox))
+
+    seen = set()
+    evaluated = 0
+    for fid, bb in candidates:
+        if fid in seen or not bb or len(bb) < 4:
+            continue
+        seen.add(fid)
+        evaluated += 1
+        if not _ui_chrome_on_frame(fid, bb, frame_provider):
+            return False            # 有一帧不在面板上 → 不是静止装饰块
+        if evaluated >= 2:
+            return True             # 换帧复判仍成立 → 静止装饰块
+    return evaluated > 0
+
+
+def drop_ui_chrome(lines: List[TrackedLine], frame_provider,
+                   chat_enabled: bool = True
+                   ) -> Tuple[List[TrackedLine], List[str]]:
+    """剔除 App 界面装饰行 / drop fixed app-furniture lines.
+
+    返回: (保留的跟踪行, 被剔除行的文本列表)。无帧提供器/非聊天界面时原样返回。
+    """
+    if not lines or frame_provider is None or not chat_enabled:
+        return list(lines), []
+    kept: List[TrackedLine] = []
+    dropped: List[str] = []
+    for line in lines:
+        if is_ui_chrome_line(line, frame_provider, chat_enabled):
+            dropped.append((line.text or "").strip())
+            continue
+        kept.append(line)
+    return kept, dropped
+
+
 def ends_sentence(text: str) -> bool:
     """以终止标点结尾 → 句子完结"""
     return bool(_TERMINAL_PUNCT_RE.search((text or "").strip()))

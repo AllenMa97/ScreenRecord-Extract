@@ -18,7 +18,7 @@ from typing import List
 
 from src.bubble_merger import (absorb_wrap_tail_leftovers, classify_side,
                                classify_side_line, drop_system_prompts,
-                               merge_wrapped_lines)
+                               drop_ui_chrome, merge_wrapped_lines)
 from src.data_types import TrackedLine, TextLine
 from src.llm_client import LlmClient
 from src.screenshot_filter import (collapse_screenshot_clusters,
@@ -120,6 +120,21 @@ class ContentAssembler:
             self._logger.log("content_assembler", "system_prompt_filter",
                              f"居中系统提示过滤: 剔除{sys_dropped}条非消息文本",
                              extra={"dropped": sys_dropped})
+
+        # App界面装饰行过滤(CV, 气泡合并前): 顶部防诈骗横幅/运营卡片/对方资料
+        # 卡片/底部输入框引导文案被OCR正常读出, 却既不是"收"也不是"发", 直接
+        # 输出就是纯假阳性。按"整宽平坦色面板"形态识别, 见 drop_ui_chrome。
+        # 同样提前到合并之前, 免得装饰文案参与方向判定/换行合并而带偏正文。
+        # / Drop fixed app furniture (banner/promo/profile cards, input hint)
+        # before merging, so it never pollutes side detection or wrap merging.
+        self._all_tracked, chrome_dropped = drop_ui_chrome(
+            self._all_tracked, self._frame_provider, self._chat_enabled)
+        if chrome_dropped:
+            self._logger.log("content_assembler", "ui_chrome_filter",
+                             f"App界面装饰过滤: 剔除{len(chrome_dropped)}条"
+                             f"横幅/卡片/输入框文案",
+                             extra={"dropped": len(chrome_dropped),
+                                    "texts": chrome_dropped})
 
         # 气泡内换行合并(CV侧几何方案, 先于LLM): 一条长消息被界面自动换行后,
         # OCR返回多行, 若不合并会被拆成多条语义不完整的结果并带偏后续消息的
