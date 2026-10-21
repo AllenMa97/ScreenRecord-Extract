@@ -1,0 +1,101 @@
+{
+  "gt_name": "chat15_voice",
+  "version": "1.0",
+  "created": "2026-10-19",
+  "video": "videos/<录制文件名>.mp4",
+  "recorded_phone": "手机①(被录制, 屏上我方消息靠右/绿色气泡)",
+  "peer_phone": "手机②(对端, 屏上靠左/白色气泡)",
+  "scripts": [
+    "gt/聊天15条草案_语音为主.md —— 人类可读文案 + 7 列 TSV + 录制协议"
+  ],
+  "purpose": "交叉验证: 气泡清单质量门 / 滚动后的聊天面板次序 / 收发方向一致率",
+  "recording": {
+    "total_items": 15,
+    "voice": 8,
+    "text": 6,
+    "sticker": 1,
+    "rhythm_seconds": 3,
+    "phases": [
+      "① 逐条发送 #1-#10",
+      "② 手动上滑到会话顶部, 再慢速分 2~3 段滚回最新(每段停 1 秒)",
+      "③ 滚回最新后发送 #11-#15"
+    ],
+    "light_mode_required": true,
+    "voice_bubbles_played_aloud": null,
+    "note": "voice_bubbles_played_aloud: true=模式B(外放播放+开麦录音, 音频侧有数据); false=模式A(未播放, 音频侧无数据)。录制者需回填。"
+  },
+  "normalization": {
+    "unicode": "NFKC",
+    "strip_whitespace": true,
+    "note": "两侧文本都做 NFKC 归一化并去掉所有空白字符; 标点、大小写、全半角数字保持原样参与比对。"
+  },
+  "scoring_rules": {
+    "matching": "multiset",
+    "matching_detail": "把预测结果与 GT 都当成多重集(Counter)。同一文本若在单帧内可同时出现多条, GT 取其'在任一单帧内同时出现的最大条数'。跨帧重复出现只算一次。",
+    "precision": "matched / 预测输出的总行数",
+    "recall": "matched / GT 总行数",
+    "f1": "2PR/(P+R)",
+    "excluded_from_gt": "被手机状态栏、输入法键盘、'按住说话'录音浮层遮挡的行不计入 GT(不计漏检)。",
+    "must_not_count_as_text": "表情包(贴纸)无文本; 语音气泡内部无文本。这两类若被预测出文本, 直接计入 precision 的分母(算误检)。"
+  },
+  "evaluation_sides": {
+    "ocr_visual_side": {
+      "gt_key": "ocr_gt_lines",
+      "gt_count": 6,
+      "default_mode": "strict",
+      "strict_scope": "分母只含 6 条打字消息的文本; 语音气泡的时长标注单列统计, 不混进主指标。",
+      "full_scope": "把 8 条语音气泡的时长标注也计入分母(需先回填 screen_duration_label)。"
+    },
+    "audio_asr_side": {
+      "gt_key": "asr_gt_lines",
+      "gt_count": 8,
+      "note": "逐条语音的口播文本。若录制为模式A(未播放语音), 音频侧无数据, 该项跳过。"
+    }
+  },
+  "items": [
+    {"id": 1, "type": "voice", "sender": "B", "spoken": "我先说下明天评审的流程", "text": null, "target_sec": 3, "screen_duration_label": null, "note": "基准"},
+    {"id": 2, "type": "text", "sender": "A", "spoken": null, "text": "收到", "note": "极短右侧文本(2字): 易被误检成语音气泡"},
+    {"id": 3, "type": "text", "sender": "A", "spoken": null, "text": "好的", "note": "同侧相邻极短文本, 与 #2 近重复"},
+    {"id": 4, "type": "voice", "sender": "B", "spoken": "前二十分钟是介绍，你可以晚点到", "text": null, "target_sec": 4, "screen_duration_label": null, "note": "紧跟在右侧短文本后, 验方向"},
+    {"id": 5, "type": "voice", "sender": "A", "spoken": "那我十点四十之前到，行吧", "text": null, "target_sec": 5, "screen_duration_label": null, "note": "发侧语音"},
+    {"id": 6, "type": "text", "sender": "B", "spoken": null, "text": "订单 SN0010 已确认收款", "note": "模板近重复 A"},
+    {"id": 7, "type": "voice", "sender": "B", "spoken": "少了超时、重试和链路追踪这三个", "text": null, "target_sec": 6, "screen_duration_label": null, "note": "长语音"},
+    {"id": 8, "type": "text", "sender": "A", "spoken": null, "text": "订单 SN0014 已确认收款", "note": "模板近重复 B(与 #6 只差 1 位, 相隔 1 条)"},
+    {"id": 9, "type": "voice", "sender": "A", "spoken": "好，我加上", "text": null, "target_sec": 2, "screen_duration_label": null, "note": "极短语音: 易与短文本混淆"},
+    {"id": 10, "type": "sticker", "sender": "B", "spoken": null, "text": null, "note": "表情包: 必须用不带文字(图上无字)的贴纸; 预期无文本"},
+    {"id": 11, "type": "voice", "sender": "B", "spoken": "另外还有个偶现问题，大概千分之三的概率会超时", "text": null, "target_sec": 7, "screen_duration_label": null, "note": "数字考点(最长一条)"},
+    {"id": 12, "type": "text", "sender": "A", "spoken": null, "text": "换了，http://10.20.30.41:8080/api/v1 这个是新的", "note": "URL: 冒号/斜杠/数字易错"},
+    {"id": 13, "type": "voice", "sender": "A", "spoken": "我导出成 csv 了，三十七号那个", "text": null, "target_sec": 5, "screen_duration_label": null, "note": "中英混排 + 数字"},
+    {"id": 14, "type": "voice", "sender": "B", "spoken": "retry 超过三次就告警", "text": null, "target_sec": 3, "screen_duration_label": null, "note": "中英混排"},
+    {"id": 15, "type": "text", "sender": "B", "spoken": null, "text": "上次那份接口文档里，字段说明是不是漏了几个？我这边按文档实现的时候发现对不上，麻烦你抽空核对一下原始设计稿", "note": "单条折成 3 行(气泡合并)"}
+  ],
+  "ocr_gt_lines": [
+    "收到",
+    "好的",
+    "订单 SN0010 已确认收款",
+    "订单 SN0014 已确认收款",
+    "换了，http://10.20.30.41:8080/api/v1 这个是新的",
+    "上次那份接口文档里，字段说明是不是漏了几个？我这边按文档实现的时候发现对不上，麻烦你抽空核对一下原始设计稿"
+  ],
+  "asr_gt_lines": [
+    "我先说下明天评审的流程",
+    "前二十分钟是介绍，你可以晚点到",
+    "那我十点四十之前到，行吧",
+    "少了超时、重试和链路追踪这三个",
+    "好，我加上",
+    "另外还有个偶现问题，大概千分之三的概率会超时",
+    "我导出成 csv 了，三十七号那个",
+    "retry 超过三次就告警"
+  ],
+  "expected_negative": {
+    "stickers": 1,
+    "note": "1 个表情包 + 8 个语音气泡(内部无文本) 都是'不应产出文本'的对象。预测结果里出现来源不明的文本行即算误检。"
+  },
+  "known_failure_modes_to_watch": [
+    "右侧极短文本(.收到./.好的.)被降阈值的气泡检测器当成语音气泡 -> 语音气泡清单多出 2 条, 顺序配对整体错位。",
+    "模板近重复被误并: #6 与 #8 只差 1 个数字、相隔 1 条, 相似度约 0.97。",
+    "滚动后聊天面板次序: 屏幕 y 会随滚动整体平移, 必须用'文档纵坐标 = 屏幕 y + 滚动偏移'排序。",
+    "语音气泡时长标注格式(3\"/0:03)解析不到时会退化成用'气泡停留时长'切音轨。",
+    "深色模式会让颜色分域失效; 键盘/录音浮层遮挡底部若干行是漏检主要来源。"
+  ]
+}

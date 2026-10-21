@@ -51,6 +51,12 @@ ground_truth/
 # Test assets (large)
 tests/avatars/
 
+# Synthetic corpora (regenerable, contains scraped wallpaper images + videos)
+synthetic/
+
+# Debug artifacts
+dbg_*.png
+
 # Node modules
 web/frontend/node_modules/
 web/frontend/dist/

@@ -6,7 +6,9 @@
   (b) 白色语音气泡+波形(左侧, 对方) 会被检出且 voice_score>=0.6, side=='收';
   (c) 绿色文本气泡(右侧) 要么不返回要么 voice_score<0.5;
   (d) 白色文本气泡(左侧) 要么不返回要么 voice_score<0.5;
-  (e) 纯背景 -> 返回 []。
+  (e) 纯背景 -> 返回 [];
+  (f) 整幅宽/半屏背景块(伪检) -> 不得返回超过 ROI 宽度上限(MAX_BUBBLE_W_RATIO)的框;
+  (g) 上缘被 ROI 裁切的语音气泡(滚动中常见) -> 仍应被检出(side=='收')。
 
 assert 风格; 直接 `python tests/test_audio/test_voice_bubble_detector.py` 运行, 不依赖 pytest。
 所有合成帧会用 render_detections 保存标注图到临时目录并打印路径(仅供人工确认, 不算失败)。
@@ -27,6 +29,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.insert(0, PROJECT_ROOT)
 
 from src.visual.voice_bubble_detector import (
+    MAX_BUBBLE_W_RATIO,
     VoiceBubble,
     detect_voice_bubbles,
     render_detections,
@@ -144,6 +147,22 @@ def make_text_bubble(side: str) -> np.ndarray:
     return img
 
 
+def make_wide_background() -> np.ndarray:
+    """整幅宽/半屏近白背景块(伪检: 应用内横幅或大片墙纸), 不应被当作语音气泡。"""
+    img = np.full((H, W, 3), BG, np.uint8)
+    _filled_rounded_rect(img, 0, 0, W - 1, 150, (250, 250, 250), radius=6)
+    return img
+
+
+def make_top_cut_voice() -> np.ndarray:
+    """上缘被 ROI 裁切的语音气泡(滚动时常见): 顶部被切掉一截, 仍应被检出。"""
+    base = make_voice_bubble("收")
+    shift = 100
+    cut = np.full((H, W, 3), BG, np.uint8)
+    cut[: H - shift] = base[shift:]      # 整幅上移, 气泡顶部被裁于 ROI 上缘
+    return cut
+
+
 def main() -> None:
     frames = {
         "voice_green_right": make_voice_bubble("发"),
@@ -151,6 +170,8 @@ def main() -> None:
         "text_green_right": make_text_bubble("发"),
         "text_white_left": make_text_bubble("收"),
         "plain_background": np.full((H, W, 3), BG, np.uint8),
+        "wide_background": make_wide_background(),
+        "top_cut_voice": make_top_cut_voice(),
     }
 
     tmp = tempfile.mkdtemp(prefix="vbd_")
@@ -190,6 +211,25 @@ def main() -> None:
                     f"{name} 文本气泡 voice_score 过高: {b.voice_score}"
                 )
             print(f"[{name}] 文本气泡 -> {len(texts)} 个候选, 均 <0.5 OK")
+            n_pass += 1
+
+        # --- 整幅宽/半屏背景块: 不得返回超过宽度上限的框(旧的整片背景伪检) ---
+        if name == "wide_background":
+            over = [b for b in bubbles if b.w > MAX_BUBBLE_W_RATIO * W]
+            assert not over, f"{name} 整幅宽背景被误检为气泡: {over}"
+            print(f"[{name}] 整幅宽背景 -> {len(bubbles)} 个候选, 无超宽框 OK")
+            n_pass += 1
+
+        # --- 上缘被裁切的语音气泡: 仍须检出(side 由位置判定为 '收') ---
+        if name == "top_cut_voice":
+            vbs = [b for b in bubbles if b.voice_score >= VOICE_OK]
+            assert vbs, f"{name} 上缘裁切气泡丢失: {bubbles}"
+            top = max(vbs, key=lambda b: b.voice_score)
+            assert top.side == "收", f"{name} side 错误: {top.side} (期望 收)"
+            print(
+                f"[{name}] 上缘裁切气泡仍检出 voice_score={top.voice_score:.2f} "
+                f"side={top.side} box={top.x},{top.y},{top.w},{top.h} OK"
+            )
             n_pass += 1
 
         # --- 渲染标注图, 供人工确认(不参与断言) ---

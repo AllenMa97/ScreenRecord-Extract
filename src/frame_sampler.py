@@ -82,6 +82,10 @@ class FrameSampler:
         self._frame_idx: int = 0
         self._current_state: str = "static"
         self._frame_id_counter: int = 0
+        # 采样帧序号 -> 视频帧序号(1基)映射。快进采样会跳帧, 因此跟踪行携带的
+        # frame_id(采样序号)与视频帧位置不再一一对应, 随机读帧时必须按此换算,
+        # 否则会读到完全不同时刻的画面(气泡像素验证/收发色判定全部失真)。
+        self._id_to_video: dict = {}
         # 帧间变化速度历史(自适应窗口)
         self._velocity_window: deque = deque(maxlen=self._adapt_window)
         self._prev_gray_small: Optional[np.ndarray] = None
@@ -131,17 +135,23 @@ class FrameSampler:
         """设置ROI框"""
         self._roi_box = roi_box
 
-    def read_roi_frame(self, frame_index: int) -> Optional[np.ndarray]:
+    def read_roi_frame(self, frame_id: int) -> Optional[np.ndarray]:
         """
-        按帧序号(1基)随机读取ROI裁剪帧, 供气泡像素验证使用。
-        pixel verification during assembly). 不改变主循环帧计数状态:
+        按采样帧序号(1基)随机读取ROI裁剪帧, 供气泡像素验证使用。
+        Random-read the ROI-cropped frame by sampled frame id (1-based),
+        for bubble pixel verification. 不改变主循环帧计数状态:
         主循环已结束, 此处只seek+read。
+
+        注意: 参数是**采样帧序号**(FrameData.frame_id), 不是视频帧序号。
+        快进采样会跳帧, 两者不相等, 必须先经 `_id_to_video` 换算再seek, 否则
+        读到的将是另一时刻的画面, 使气泡像素验证/收发色判定失效。
         """
         if self._cap is None or not self._cap.isOpened():
             return None
-        if frame_index < 1 or frame_index > self._total_frames:
+        video_index = self._id_to_video.get(frame_id, frame_id)
+        if video_index < 1 or video_index > self._total_frames:
             return None
-        self._cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index - 1)
+        self._cap.set(cv2.CAP_PROP_POS_FRAMES, video_index - 1)
         ok, frame = self._cap.read()
         if not ok or frame is None:
             return None
@@ -280,17 +290,21 @@ class FrameSampler:
 
     def _fast_forward_frame(self) -> Optional[FrameData]:
         """快进采样: 跳帧解码, 与静止参考帧比较"""
-        # 跳过step-1帧(仅grab不解码)
+        # 跳过step-1帧(仅grab不解码), 再retrieve()解码缓冲中的最后一帧。
         for _ in range(self._step - 1):
             if not self._cap.grab():
                 self._logger.log("frame_sampler", "eof", "视频结束 / End of video")
                 return None
-            self._frame_idx += 1
         ret, frame = self._cap.retrieve()
         if not ret:
             self._logger.log("frame_sampler", "eof", "视频结束 / End of video")
             return None
-        self._frame_idx += 1
+        # 以解码器真实位置为准(1基)。手工累加在 grab/retrieve 语义下会漂移:
+        # grab()只取帧到内部缓冲、retrieve()解码的是"最后一次grab的那帧",
+        # 手工+1会让解码进度与 _frame_idx 每快进一次就差1帧并线性累积
+        # (实测+50/+100/+200帧), 导致 _id_to_video 映射失真、read_roi_frame
+        # 按错误帧号seek, 读到另一时刻的画面。
+        self._frame_idx = int(round(self._cap.get(cv2.CAP_PROP_POS_FRAMES)))
         current_time = self._frame_idx / self._fps
 
         gray_small = self._compute_roi_gray_small(frame)
@@ -338,6 +352,7 @@ class FrameSampler:
         """构造帧数据(公共)"""
         roi_frame = self._get_roi_frame(frame)
         self._frame_id_counter += 1
+        self._id_to_video[self._frame_id_counter] = self._frame_idx
 
         pc_state = self._classify_pc_state(self._pc_last_peak, self._pc_last_dy)
         self._logger.log("frame_sampler", "sample",

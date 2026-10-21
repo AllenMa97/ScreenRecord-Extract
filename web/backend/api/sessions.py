@@ -16,6 +16,7 @@ from .. import config as web_config
 from ..services import frame_data, session_store as store
 from ..services.extractor import manager
 from ..services.video_meta import read_video_meta
+from ..services.voice_audio import VOICES_DIR
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
@@ -111,6 +112,25 @@ def get_video(sid: str):
     if path is None or not path.is_file():
         raise HTTPException(404, "视频不存在")
     return FileResponse(str(path), media_type="video/mp4")
+
+
+@router.get("/{sid}/voices/{name}")
+def get_voice_audio(sid: str, name: str):
+    """单条语音 wav(逐条审听用) / A single voice-message wav (for review).
+
+    仅允许从 output/voices/ 读取(防止路径穿越); 文件名由后端生成。
+    """
+    _get_meta(sid)
+    base = store.output_dir(sid) / VOICES_DIR
+    # 防路径穿越: 只接受原始文件名, 拒绝包含目录分隔或父级引用
+    try:
+        candidate = base.joinpath(name)
+        candidate.resolve().relative_to(base.resolve())
+    except (ValueError, OSError):
+        raise HTTPException(400, "非法文件名 / invalid voice file name")
+    if not candidate.is_file():
+        raise HTTPException(404, "语音文件不存在")
+    return FileResponse(str(candidate), media_type="audio/wav")
 
 
 # ----------------------------------------------------------------------

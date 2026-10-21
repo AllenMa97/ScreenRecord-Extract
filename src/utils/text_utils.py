@@ -5,6 +5,7 @@
 """
 
 import re
+import unicodedata
 from typing import Tuple
 import numpy as np
 
@@ -106,3 +107,67 @@ def is_meaningful_text(text: str, min_length: int = 2) -> bool:
     """
     cleaned = re.sub(r"[\s\d\W]", "", text)
     return len(cleaned) >= min_length
+
+
+# ---- 数字锚点 / digit anchor ------------------------------------------------
+# 模板消息(订单SN0010 / 订单SN0014、您的快递8812 / 8816)的文字部分完全一致,
+# 唯一区别是数字位。编辑距离相似度对这类"仅数字不同"的近重复给出的分值极高
+# (11字差1字 → 0.91), 任何基于相似度的判据都分不开它们, 只有把数字单独抽出来
+# 逐位比对才行 —— 这就是"数字锚点"。
+# Template messages differ only in their digits, and edit-distance similarity
+# scores them near-identically; comparing the digit runs positionally is the
+# only reliable discriminator.
+
+def digit_anchor(text: str) -> str:
+    """数字锚点: NFKC 归一后所有数字字符的逐位拼接。
+
+    用"拼接"而非"按标点分组", 以容忍 OCR/ASR 在标点上的抖动
+    ("repro-20261016-0037.md" 与 "repro202610160037MD" 锚点相同)。
+    """
+    s = unicodedata.normalize("NFKC", text or "")
+    return "".join(re.findall(r"\d", s))
+
+
+def digit_skeleton(text: str) -> str:
+    """去掉数字段后的文本骨架(用于判断"差异是否只在数字位")。"""
+    s = unicodedata.normalize("NFKC", text or "")
+    return re.sub(r"\d+", "", s)
+
+
+def _is_subsequence(short: str, long: str) -> bool:
+    """short 是否为 long 的子序列(不要求连续)。"""
+    it = iter(long)
+    return all(ch in it for ch in short)
+
+
+def anchors_compatible(a: str, b: str, min_len: int = 4) -> bool:
+    """两个数字锚点是否相容 / whether two digit anchors can be the same message.
+
+    相容 = 完全相等, 或短锚点是长锚点的**子序列**(容忍 OCR/ASR 多读或漏读一位
+    数字)。子序列仅在长锚点达到 min_len 时放行, 防 "12"⊂"123" 之类偶然包含。
+    任一侧无数字时视为相容(不构成冲突)。
+    """
+    if not a or not b or a == b:
+        return True
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    return len(long) >= min_len and _is_subsequence(short, long)
+
+
+def template_digit_conflict(a: str, b: str,
+                            skeleton_sim: float = 0.90,
+                            anchor_min_len: int = 4) -> bool:
+    """两文本是否"同模板、数字不同"→ 应判为**不同消息**。
+
+    判据(同时满足才算冲突 / both must hold):
+      1) 两侧都含数字, 且数字锚点不相容(见 `anchors_compatible`);
+      2) 去掉数字后的骨架相似度 ≥ skeleton_sim —— 即差异**只在数字位**。
+    条件 2 把判据收紧到模板近重复, 避免误伤"数字不同且内容也不同"的正常匹配。
+
+    >>> template_digit_conflict("订单SN0010已确认收款", "订单SN0014已确认收款")
+    True
+    >>> template_digit_conflict("订单SN0010已确认收款", "订单SN00l0已确认收款")
+    False
+    """
+    if anchors_compatible(digit_anchor(a), digit_anchor(b), anchor_min_len):
+        return False
+    return text_similarity(digit_skeleton(a), digit_skeleton(b)) >= skeleton_sim

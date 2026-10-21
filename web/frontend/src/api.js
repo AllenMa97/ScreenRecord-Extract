@@ -65,6 +65,9 @@ export const api = {
   result: (sid) => request(`/sessions/${sid}/result`),
   logs: (sid, offset, limit) =>
     request(`/sessions/${sid}/logs?offset=${offset}&limit=${limit}`),
+
+  // 逐条语音(审听用) / per-voice wav for review
+  voiceUrl: (sid, name) => `${BASE}/sessions/${sid}/voices/${name}`,
 }
 
 /**

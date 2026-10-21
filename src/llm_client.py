@@ -14,8 +14,10 @@ LLM客户端(可选)
 import bisect
 import json
 import re
+import unicodedata
 from typing import List, Optional
 
+from src.audio.ocr_voice_scanner import parse_duration_seconds
 from src.bubble_merger import STAMP_RE, classify_side, classify_side_line
 from src.data_types import TrackedLine
 from src.utils.behavior_logger import BehaviorLogger
@@ -59,6 +61,68 @@ _LLM_TIME_RE = re.compile(
 _REJOIN_MIN_LEN = 4
 _REJOIN_MIN_FRACTION = 0.05
 
+# 同一消息的"OCR变体"判重参数(LLM输出后的滚动去重): 归一化(去标点/空白、统一
+# 全半角与小写)后做近似匹配, 并强制"数字锚点"完全一致 —— 否则"您的快递8812"
+# 与"您的快递8816"这类仅数字不同的模板近重复消息会被误合并。
+# Variant-duplication parameters: normalized near-match plus an identical digit
+# anchor, so template-near-duplicates differing only in a digit stay separate.
+_VARIANT_SIM = 0.85          # 归一化文本相似度阈值 / normalized similarity threshold
+_VARIANT_MIN_LEN = 8         # 前缀包含判重的最短长度(防"好"被长消息吸走) / min length
+_VARIANT_MIN_RATIO = 0.35    # 前缀包含判重的最短长度占比 / min length ratio
+_VARIANT_PREFIX_SIM = 0.90   # 前缀对齐相似度(容忍截断处的1~2字OCR差异) / prefix sim
+
+
+def _variant_key(text: str) -> str:
+    """归一化判重键: NFKC统一全半角 → 去空白/标点/符号 → 小写(数字原样保留)。"""
+    s = unicodedata.normalize("NFKC", text or "")
+    s = re.sub(r"[\s\W_]+", "", s, flags=re.UNICODE)
+    return s.lower()
+
+
+def _digit_anchor(text: str) -> str:
+    """数字锚点: NFKC后所有数字字符的逐位拼接。
+
+    用"拼接"而非"按标点分组"是为了容忍OCR/ASR在标点上的抖动(视觉
+    "repro-20261016-0037.md" 与 ASR "repro202610160037MD" 的锚点相同),
+    同时仍能区分数字本身不同的模板消息("您的快递8812" vs "您的快递8816")。
+    """
+    s = unicodedata.normalize("NFKC", text or "")
+    return "".join(re.findall(r"\d", s))
+
+
+def _is_same_message(a: str, b: str) -> bool:
+    """两条输出文本是否指向"同一条消息"(OCR变体/滚动重复/滚动截断读法)。"""
+    ka, kb = _variant_key(a), _variant_key(b)
+    if not ka or not kb:
+        return False
+    if _digit_anchor(a) != _digit_anchor(b):
+        return False
+    if ka == kb:
+        return True
+    if text_similarity(ka, kb) >= _VARIANT_SIM:
+        return True
+    # 滚动截断读法: 短键 ≈ 长键的前缀(半截行), 长度足够且占比达标。
+    # 允许截断处有1~2字OCR差异(如 "...-0042.Ic" 对 "...-0042.Ig 了, ..."),
+    # 故用"短键 vs 长键同长前缀"的相似度判定, 而非严格 startswith。
+    short, long = (ka, kb) if len(ka) <= len(kb) else (kb, ka)
+    if len(short) < _VARIANT_MIN_LEN or len(short) < _VARIANT_MIN_RATIO * len(long):
+        return False
+    return text_similarity(short, long[:len(short)]) >= _VARIANT_PREFIX_SIM
+
+
+# 聊天时间戳行(时间分隔条)有效性判定:
+# 仅"消息列表区域内、水平居中"的 HH:MM 行才是聊天时间分隔条。据此排除两类
+# 伪时间戳(它们同样是 HH:MM 形态, 旧的"只要是 HH:MM 就算聊天时间"会误采):
+#   1. 顶部条带(Y < 条带高)内的系统状态栏时钟/标题栏时间;
+#   2. 靠边对齐的界面时间值(设置页"已开机时间 49:25"、回单时间、账号/字段值)。
+# 微信/QQ 的时间分隔条固定**水平居中**, 因此"居中"是廉价且高精度的判据。
+# 容差需收紧: 实测非分隔条的时间值虽非贴边, 也会落在 ROI 中心左右约 50~65px
+# 内(如底部悬浮媒体播放条的当前/总时长 "0:21/0:42", 中心偏移 52~54px), 宽松容差
+# 会误采。真实分隔条严格居中(偏移 < 10px), 取 0.08 两侧余量充足。
+_STAMP_CENTER_TOL = 0.08           # 居中容差(ROI宽度比例)
+_STAMP_TOP_STRIP_RATIO = 0.08      # 顶部条带高度占ROI比例(与 pipeline 同口径)
+_STAMP_TOP_STRIP_MIN_PX = 120      # 顶部条带最小高度(px)
+
 
 def _is_short_bubble(bbox) -> bool:
     """短回复气泡尺寸检查: 宽高需达到气泡级, 排除App界面微型标签
@@ -81,12 +145,35 @@ def _pos(line: TrackedLine) -> tuple:
     return line.first_bbox or line.bbox
 
 
-def _build_stamp_index(tracked_lines: List[TrackedLine]):
+def _is_chat_stamp(line: TrackedLine, roi_w: int, roi_h: int) -> bool:
+    """HH:MM 行是否为"聊天时间分隔条"(而非状态栏时钟/设置页时长值等)。
+
+    - 位于顶部UI条带(标题栏/状态栏区域)内 → 系统时钟/界面时间 → 非聊天时间;
+    - 水平不居中 → 聊天分隔条必居中, 靠边的值(设置页"已开机时间 49:25"等)
+      不是聊天时间。
+    roi 尺寸未知(<=0)时保持旧行为(不额外过滤), 避免误伤无尺寸信息的调用方。
+    """
+    if roi_w <= 0 or roi_h <= 0:
+        return True
+    x1, y1, x2, y2 = _pos(line)
+    strip_h = min(_STAMP_TOP_STRIP_RATIO * roi_h, _STAMP_TOP_STRIP_MIN_PX)
+    if y1 < strip_h:
+        return False
+    cx = (x1 + x2) / 2.0
+    return abs(cx - roi_w / 2.0) <= _STAMP_CENTER_TOL * roi_w
+
+
+def _build_stamp_index(tracked_lines: List[TrackedLine],
+                       roi_w: int = 0, roi_h: int = 0):
     """收集并排序聊天时间戳行, 供二分最近时间匹配使用
+
+    只采信"消息列表区域内、水平居中"的时间分隔条(_is_chat_stamp), 排除
+    系统状态栏时钟与设置页/回单页里同形的 HH:MM 字段值。
     """
     stamps = [
         l for l in tracked_lines
         if (l.text or "").strip() and STAMP_RE.fullmatch((l.text or "").strip())
+        and _is_chat_stamp(l, roi_w, roi_h)
     ]
     stamps_sorted = sorted(stamps, key=lambda s: (s.first_timestamp, _pos(s)[1]))
     stamps_ts = [s.first_timestamp for s in stamps_sorted]
@@ -215,6 +302,7 @@ class LlmClient:
         chat_cfg = (config or {}).get("chat_format", {})
         self._chat_enabled: bool = chat_cfg.get("enabled", True)
         self._roi_width: int = int(chat_cfg.get("roi_width", 0) or 0)
+        self._roi_height: int = 0        # ROI高度(时间戳顶部条带判定用, 流水线注入)
         self._center_margin: int = int(chat_cfg.get("center_margin", 20))
         self._time_fallback: bool = chat_cfg.get("time_fallback", True)
         self._frame_provider = None      # 气泡像素颜色判定用帧提供器(流水线注入)
@@ -225,6 +313,11 @@ class LlmClient:
         """
         if width and int(width) > 0:
             self._roi_width = int(width)
+
+    def set_roi_height(self, height: int) -> None:
+        """设置ROI高度(时间戳顶部条带判定用, 由流水线按实际ROI传入)"""
+        if height and int(height) > 0:
+            self._roi_height = int(height)
 
     def set_frame_provider(self, provider) -> None:
         """设置按帧序号(1基)取ROI帧的回调, 供气泡填充色判定收发。"""
@@ -293,7 +386,8 @@ class LlmClient:
         OCR切成多行/多次观测(换行截断、滚动半屏、气泡过长), 需要按
         时间接近 + 方向一致 + 内容衔接 合并还原。
         """
-        stamps_sorted, stamps_ts = _build_stamp_index(tracked_lines)
+        stamps_sorted, stamps_ts = _build_stamp_index(
+            tracked_lines, self._roi_width, self._roi_height)
         lines_text = []
         for line in sorted(tracked_lines,
                            key=lambda x: (x.first_timestamp, _pos(x)[1])):
@@ -302,6 +396,12 @@ class LlmClient:
                 continue
             if STAMP_RE.fullmatch(text):
                 continue  # 时间戳行不进正文
+            # 语音气泡内的时长标签(如 6"…): 不是聊天消息, 不进 prompt,
+            # 避免LLM将其原样输出为消息行
+            # / Duration label inside a voice bubble: not a chat message,
+            # keep it out of the prompt so the LLM cannot echo it back.
+            if parse_duration_seconds(text) is not None:
+                continue
             side = self._classify_side(line)
             side_txt = {"发": "我方发出", "收": "对方发出"}.get(side, "方向未知")
             st = _nearest_stamp(stamps_sorted, stamps_ts, line)
@@ -322,7 +422,7 @@ class LlmClient:
 
 【输入字段说明】
 - [视频t=x.xs]: 该行在视频中的时刻(秒), 用于判断碎片是否紧邻
-- [聊天时间xx:xx]: 界面右上角显示的时间戳, 输出时沿用
+- [聊天时间xx:xx]: 该行所属消息列表内"时间分隔条"的显示时间(居中时间条), 输出时沿用
 - [我方发出/对方发出/方向未知]: 按气泡水平位置判断的收发方向
 - (置信度, 观测次数): OCR置信度与多次观测投票
 
@@ -448,7 +548,8 @@ class LlmClient:
         if not authority:
             return
 
-        stamps_sorted, stamps_ts = _build_stamp_index(tracked_lines)
+        stamps_sorted, stamps_ts = _build_stamp_index(
+            tracked_lines, self._roi_width, self._roi_height)
 
         def real_time(line: TrackedLine) -> str:
             """权威行对应的真实聊天时间(LLM改写的时间一律以它为准)"""
@@ -487,35 +588,54 @@ class LlmClient:
                         best = (t, line)
             return best_exact or best
 
-        seen = set()   # 已输出的权威行文本(同文本只保留一次)
-        for sec in sections:
-            rows = [self._split_llm_line(ln)
-                    for ln in (sec.get("content") or "").split("\n")]
-            out = []
-            for head, content in rows:
-                if not content.strip():
-                    out.append((head, content))
-                    continue
-                hit = best_authority(content)
-                if hit is None:
-                    out.append((head, content))
-                    continue
-                t, line = hit
-                if t in seen:
-                    continue        # 同一权威行的滚动重复/拼接残影 → 丢弃
-                seen.add(t)
-                # 时间以权威行真实时间为准; 收发标记优先用像素判定的权威方向
-                # (LLM可能沿用了错误的方向标注), 无像素证据时保留LLM原值
-                auth_side = self._classify_side(line)
-                parts = head.split()
-                mark = parts[-1] if parts and parts[-1] in ("[发]", "[收]") else ""
-                if auth_side:
-                    mark = f"[{auth_side}]"
-                new_head = (real_time(line) + (" " + mark if mark else "")).strip()
-                out.append((new_head, t))
+        # 展平为全局行序列(段落边界不影响滚动去重), 便于跨段落判重
+        flat = []      # 每项 [head, content, sec_idx]; content=None 表示已丢弃
+        for si, sec in enumerate(sections):
+            for ln in (sec.get("content") or "").split("\n"):
+                head, content = self._split_llm_line(ln)
+                flat.append([head, content, si])
+
+        # 已保留的权威行: 归一化近似判重(同一消息的OCR变体/滚动残影/滚动截断读法
+        # 只保留一次), 并保留数字锚点约束避免仅数字不同的模板消息被误合并。
+        emitted = []   # 每项 [代表文本, flat下标]
+        for idx, row in enumerate(flat):
+            head, content = row[0], row[1]
+            if not content.strip():
+                continue
+            hit = best_authority(content)
+            if hit is None:
+                continue
+            t, line = hit
+            dup = next((e for e in emitted
+                        if _is_same_message(e[0], t)), None)
+            if dup is not None:
+                # 同一消息重复出现: 若本条读法更完整则升级代表文本
+                # (时间仍保留首次出现, 即该消息最早被看到的时刻)
+                if len(t) > len(dup[0]):
+                    dup[0] = t
+                    flat[dup[1]][1] = t
+                row[1] = None
+                continue
+            emitted.append([t, idx])
+            # 时间以权威行真实时间为准; 收发标记优先用像素判定的权威方向
+            # (LLM可能沿用了错误的方向标注), 无像素证据时保留LLM原值
+            auth_side = self._classify_side(line)
+            parts = head.split()
+            mark = parts[-1] if parts and parts[-1] in ("[发]", "[收]") else ""
+            if auth_side:
+                mark = f"[{auth_side}]"
+            row[0] = (real_time(line) + (" " + mark if mark else "")).strip()
+            row[1] = t
+
+        out_by_sec = [[] for _ in sections]
+        for head, content, si in flat:
+            if content is None:
+                continue
+            out_by_sec[si].append((head, content))
+        for si, sec in enumerate(sections):
             sec["content"] = "\n".join(
                 f"- {head} ：{content}" if head else content
-                for head, content in out)
+                for head, content in out_by_sec[si])
         # 全部被去重的段落移除, 避免前端渲染空段落
         sections[:] = [s for s in sections if (s.get("content") or "").strip()]
 
@@ -558,7 +678,8 @@ class LlmClient:
           时间戳匹配由"全量扫描 O(n×m)"降为"排序+二分 O(n log m)"。
         """
         # 预收集时间戳行(用于消息时间关联), 排序后二分查找最近时间戳
-        stamps_sorted, stamps_ts = _build_stamp_index(tracked_lines)
+        stamps_sorted, stamps_ts = _build_stamp_index(
+            tracked_lines, self._roi_width, self._roi_height)
 
         def fmt_line(line: TrackedLine, text: str) -> str:
             """生成 "- 时间 [发] ：内容" 格式行"""
@@ -647,6 +768,12 @@ class LlmClient:
             text2 = _TRAILING_STAMP_RE.sub("", text).strip()
             if text2:
                 text = text2
+            # 语音气泡内的时长标签(如 6"…): 不是聊天消息, 与 pipeline 上游
+            # 清洗同口径剔除, 否则会以正文行形态混入聊天面板
+            # / Duration label inside a voice bubble (e.g. 6"…): not a chat
+            # message; drop here with the same rule as the pipeline upstream.
+            if parse_duration_seconds(text) is not None:
+                continue
             # 界面装饰过滤(兜底): 日期分隔条(如"五月4")/在线状态是界面信息,
             # 不是聊天消息, 降级路径也一律丢弃(与LLM提示规则8一致)
             if _DATE_DIVIDER_RE.fullmatch(text) or text in _ONLINE_STATUS:

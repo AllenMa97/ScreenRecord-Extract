@@ -21,6 +21,7 @@ from src.config_loader import Config
 from src.pipeline import ExtractionPipeline
 
 from . import session_store as store
+from . import voice_audio
 
 
 class ExtractionManager:
@@ -151,6 +152,15 @@ class ExtractionManager:
             self._fail(sid, events, str(result["error"]))
             return
 
+        # 提取完成后: 按 voice_events 切出逐条语音 wav 并回填 audio_url,
+        # 供前端"找到并审听"每条语音(voice_audio.build_voice_audio 幂等)。
+        # Post-extract: slice each voice message into a wav and attach audio_url.
+        try:
+            voice_audio.build_voice_audio(sid, str(video), result)
+        except Exception as exc:  # noqa: BLE001 - 语音切片失败不阻断结果保存
+            import logging
+            logging.getLogger(__name__).warning("逐条语音切片失败: %s", exc)
+
         # 完成时进度写满, 避免"已done但进度停在中间"的观感 / mark 100% on done
         cur_progress = (store.load_meta(sid) or {}).get("progress") or {}
         meta_updates = {
@@ -186,6 +196,11 @@ class ExtractionManager:
             p = out_dir / name
             if p.is_dir():
                 shutil.rmtree(p, ignore_errors=True)
+        # 清理上次的逐条语音 (build_voice_audio 会在下次重新切)
+        try:
+            voice_audio.clean_voices(out_dir)
+        except Exception:
+            pass
         # 结果/报告按视频名输出, 用通配符整体清理
         # Results/reports are per-video; clean them via glob patterns.
         for pattern in ("behavior_log.jsonl",

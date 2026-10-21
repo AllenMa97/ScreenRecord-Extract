@@ -4,3 +4,4 @@ pyyaml>=6.0
 imagehash>=4.3.0
 Pillow>=10.0.0
 requests>=2.31.0
+av>=10.0.0          # 音频通道: 音轨解码(PyAV, 自带 FFmpeg) / audio channel

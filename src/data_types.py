@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from enum import Enum
 
+from src.utils.text_consensus import consensus_text
+
 
 @dataclass
 class TextLine:
@@ -62,11 +64,12 @@ class TrackedLine:
         self.last_seen_frame = line.frame_id
         self.last_timestamp = line.timestamp
         self.bbox = line.bbox
-        # 多帧投票: 选择出现次数最多的文本
-        text_counts: dict = {}
-        for obs in self.observations:
-            text_counts[obs.text] = text_counts.get(obs.text, 0) + 1
-        self.text = max(text_counts, key=text_counts.get)
+        # 多帧投票(字符级对齐): 逐位取票数最高的字符, 能吸收"每次错在不同字"的抖动。
+        # 权重用 OCR 置信度, 置信度高的观测票更重; 下限 0.1 防止零权重。
+        self.text = consensus_text(
+            [o.text for o in self.observations],
+            [max(0.1, float(o.confidence or 0.0)) for o in self.observations],
+        )
         confidences = [o.confidence for o in self.observations]
         self.confidence = sum(confidences) / len(confidences)
 

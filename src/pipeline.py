@@ -48,14 +48,21 @@ from src.content_assembler import ContentAssembler
 from src.data_types import TextLine
 from src.utils.behavior_logger import BehaviorLogger
 from src.utils.image_utils import compute_mae, compute_dhash, hamming_distance
+from src.visual.chat_scene import chat_scene_reason
 
 from src.audio.asr_client import AsrClient
 from src.audio.transcriptor import transcribe_media, TranscriptResult
-from src.audio.voice_bubble_scanner import VoiceBubbleScanner, merge_ocr_and_vision
+from src.audio.voice_bubble_scanner import (VoiceBubbleScanner,
+                                            cluster_static_observations,
+                                            drop_narrow_bubbles,
+                                            drop_text_bubbles,
+                                            merge_ocr_and_vision,
+                                            probe_media_duration)
 from src.audio.audio_loader import has_audio_track
-from src.audio.report_merge import merge_into_result
+from src.audio.report_merge import (build_scroll_curve, merge_into_result,
+                                    scroll_offset_at)
 from src.audio.data_types import VoiceEvent
-from src.audio.ocr_voice_scanner import OcrVoiceScanner
+from src.audio.ocr_voice_scanner import OcrVoiceScanner, parse_duration_seconds
 
 
 # 流水线哨兵
@@ -85,6 +92,39 @@ _UI_DIVIDER_BAND_HI = 115    # 带上界: strip_h 之下偏移
 # 尾随聊天时间戳: OCR 常把消息与相邻时间戳粘成一行("对啊23:47"/"我没有切换23:40.11"),
 # 时间戳是界面标记, 剥离后才是消息正文。
 _TRAILING_STAMP_RE = re.compile(r"\d{1,2}:\d{2}(?:\.\d+)?\s*√?\s*$")
+# 语音气泡时长标签(如 "5\" ((" / ") 4\"" / "18\" (" / "4° ("):
+# 语音消息气泡渲染"时长 + 播放图标", OCR 常把图标读成引号/括号/度号, 得到
+# 一串"数字 + 引号/括号"的伪文本。它是界面标记(气泡元信息)而非消息正文。
+# 判据: 不含汉字/字母, 含数字, 且全部字符都落在数字/引号/括号集合内。
+# Voice-bubble duration badge ("5\" ((" / "18\" (" ...): UI metadata, not content.
+_VOICE_BADGE_CHARS = set("0123456789\"'’‘“”″°()（）[]【】{}<> \t")
+# 长按菜单 / 气泡操作按钮文案: 界面元素, 不属于消息。
+# ALWAYS: 只会出现在菜单里的文案, 直接丢弃;
+# AMBIGUOUS: 可能与真实消息同形(如单独一条"删除"), 仅当同一帧出现 >=2 个
+# 不同文案时才判定为菜单簇一并丢弃, 避免误杀正文。
+# Long-press menu / bubble-action labels: UI chrome, not messages.
+_UI_LABEL_ALWAYS = frozenset({"转文字", "听筒播放", "背景播放", "连续朗读",
+                              "倍速播放"})
+_UI_LABEL_AMBIGUOUS = frozenset({"收藏", "删除", "多选", "引用", "提醒",
+                                 "复制", "转发", "翻译", "搜一搜", "朗读"})
+# 撤回提示条(如"你撤回了一条消息"/"对方撤回了一条消息"): 系统通知, 不是消息
+_RECALL_NOTICE_RE = re.compile(r"^.{0,6}撤回了一条消息$")
+# 系统弹窗/通知(如'电量剩余20%是否开启"省电模式"?'): 手机系统 UI 覆盖层, 不是聊天
+# 消息。对话框自带的按钮文案(如"开启"/"取消")单独看与正文同形, 故仅当同一帧出现
+# 对话框正文时才随簇一并丢弃(与长按菜单簇同一策略, 防误杀正文)。
+# System dialog / OS notification banner: OS chrome, not a chat message.
+_SYS_DIALOG_RE = re.compile(
+    r"(?:电量|电池)(?:剩余|不足|低于)?\s*\d{1,3}\s*%"      # 电量剩余20%
+    r"|是否(?:开启|关闭).{0,6}(?:模式|省电|功能)"           # 是否开启"省电模式"?
+)
+_DIALOG_BUTTONS = frozenset({"开启", "关闭", "取消", "确定", "允许", "拒绝",
+                             "稍后", "知道了", "立即开启", "立即关闭"})
+
+
+def _is_voice_badge(t: str) -> bool:
+    """语音气泡时长标签判据 / voice-bubble duration badge test"""
+    return (any(ch.isdigit() for ch in t)
+            and all(ch in _VOICE_BADGE_CHARS for ch in t))
 
 
 class ExtractionPipeline:
@@ -135,6 +175,12 @@ class ExtractionPipeline:
         self._ocr_client = OcrClient(config.ocr, self._logger)
         # 滚动帧低置信度过滤阈值(残影识别置信度更低)
         self._scroll_conf: float = float(config.ocr.get("scroll_confidence_threshold", 0.65))
+        # OCR行级最低置信度: 真实聊天正文的PP-OCR置信度普遍>=0.95, 而气泡波形
+        # 图标、滚动半截行的误识置信度明显更低(实测0.56~0.81)。用统一阈值把这类
+        # 噪声挡在文本跟踪之前, 避免其被当作消息输出、或与相邻正文粘成一行。
+        # Per-line OCR confidence floor: real chat text scores >=0.95 while waveform
+        # icons / half-scrolled lines score far lower; drop them before tracking.
+        self._ocr_min_conf: float = float(config.ocr.get("min_confidence", 0.85))
         self._text_tracker = MessageBubbleTracker(config.text_tracker, self._logger)
         self._state_machine = StateMachine(config.state_machine, self._logger)
         self._semantic_dedup = SemanticDedup(config.llm, self._logger)
@@ -149,6 +195,13 @@ class ExtractionPipeline:
         self._start_time: float = 0.0
         self._last_progress_ts: float = 0.0
         self._progress_interval: float = 2.0  # 控制台进度打印间隔(秒)
+        # 聊天/非聊天界面分离: 非聊天帧(转账回单/银行页/设置页/长按菜单等)的
+        # OCR行整帧丢弃, 从入口挡住非聊天内容污染正文。逐帧判定结果按fid暂存,
+        # 供消费线程(_consume_ocr_frame)查用; 采用有界字典防止长视频下无限增长。
+        self._chat_scene_filter: bool = bool(config.roi.get("chat_scene_filter", True))
+        self._chat_wall_ratio: float = float(config.roi.get("chat_wall_ratio", 0.35))
+        self._frame_chat: dict = {}
+        self._frame_chat_max: int = 64
         self._stats = {
             "frames_sampled": 0,
             "frames_blur_skipped": 0,
@@ -156,6 +209,7 @@ class ExtractionPipeline:
             "frames_dedup_skipped": 0,
             "frames_ocr_processed": 0,
             "frames_scroll_ignored": 0,
+            "frames_non_chat_skipped": 0,
             "frames_scroll_thinned": 0,
             "frames_scroll_suppressed": 0,
             "frames_scroll_sampled": 0,
@@ -178,6 +232,15 @@ class ExtractionPipeline:
         self._ocr_cache_path: Optional[str] = None
         self._ocr_cache_fh = None
         self._ocr_cache: dict = {}       # fid -> 该帧的缓存文本行
+        # fid -> 该帧 OCR 行所属的 ROI 原点(x, y)。自适应 ROI 在预热结束时会把
+        # 原点从 margin 基准挪到内容带(实测 (0,60) → (0,302)), 而缓存里的 bbox 是
+        # **裁图当时**那一版 ROI 的局部坐标; 用单一"终版 ROI"换算所有帧会整体平移
+        # 242px(见 `_roi_origin`)。
+        self._frame_roi: dict = {}
+        # OCR调用失败(提交/轮询失败, 或重试后仍空)的帧: 其"空结果"不可信, 不落
+        # 断点缓存/内容指纹缓存, 避免一次瞬时故障被永久固化(重放命中空缓存 →
+        # 整轮视觉通道静默 0 行)。
+        self._ocr_failed_fids: set = set()
 
         # 内容指纹OCR复用: 同内容帧不重复调用OCR(视觉噪声积累的兜底)
         self._content_reuse_max_hd: int = int(config.visual_dedup.get(
@@ -195,6 +258,10 @@ class ExtractionPipeline:
         self._audio_thread: Optional[threading.Thread] = None
         self._audio_result: Optional[object] = None      # TranscriptResult
         self._audio_events: List[object] = []            # List[VoiceEvent]
+        self._static_obs: List[dict] = []                # 静止帧气泡原始观测
+        self._scroll_curve_img: List[tuple] = []         # 图像侧滚动曲线
+        self._ocr_text_hits: List[object] = []           # 正文行(质量门用)
+        self._ocr_duration_hits: List[object] = []       # 时长标签(反证用)
         self._audio_error: Optional[Exception] = None
 
         # 抽帧诊断保存
@@ -349,6 +416,7 @@ class ExtractionPipeline:
             self._sampler.set_roi_box(roi_box)
             self._text_tracker.set_roi_dimensions(roi_box[3], roi_box[2])
             self._assembler.set_roi_width(roi_box[2])
+            self._assembler.set_roi_height(roi_box[3])
             print(f"[进度] ROI已检测: {roi_box}", flush=True)
             self._logger.log("pipeline", "roi_detected",
                              f"ROI: {roi_box}")
@@ -581,22 +649,55 @@ class ExtractionPipeline:
             return
         scanner = VoiceBubbleScanner(
             roi_box=tuple(int(v) for v in roi_box),
-            voice_threshold=self._safe_float(cfg, "bubble_threshold", 0.55),
+            # 默认 0.55 是针对旧渲染(波形条)调的; 新视觉拟真 UI 下真实气泡
+            # voice_score 集中在 0.50~0.55(喇叭图标+真实颜色), 再用 0.55 就会
+            # 把首条滞后 10s 以上(见 v3_realui vs v3_synth 的首事件时间差)。
+            # 降到 0.45 留冗余, 同时保留低置信度 UI chrome 的抑制能力。
+            voice_threshold=self._safe_float(cfg, "bubble_threshold", 0.45),
             sample_interval_s=self._safe_float(
                 cfg, "bubble_sample_interval_s", 0.2),
         )
         vision_events = scanner.scan(video_path)
+        # 静止帧的逐帧原始检测: 供 `cluster_static_observations` 在合并阶段按文档
+        # 坐标重建气泡清单(跨帧身份跟踪在滚动式录屏上会错接, 见该函数说明)。
+        self._static_obs = list(scanner.static_observations)
+        self._scroll_curve_img = list(scanner.scroll_curve)
         # OCR时长标签仅作框内佐证(不在视觉清单外独立计数),
         # 避免全局 mm:ss 把界面时钟/进度误判为语音气泡。
         ocr_hits = []
+        text_hits = []
         try:
             ocr_scanner = OcrVoiceScanner(
                 frame_width=getattr(self._roi_manager, "_frame_size", (890, 1920))[0])
-            ocr_hits = ocr_scanner.scan_duration_hits(self._ocr_cache_path)
+            # OCR 缓存的 bbox 是 ROI 局部坐标, 视觉气泡框是原始帧坐标; 传入 ROI
+            # 左上角偏移, 把标签框换算到原始帧坐标系后再做框内佐证(否则 y 恒定
+            # 错开 ROI.y, 时长标签几乎永远匹配不上)。
+            roi_offset = (int(roi_box[0]), int(roi_box[1]))
+            ocr_hits = ocr_scanner.scan_duration_hits(
+                self._ocr_cache_path, roi_offset=roi_offset)
+            # 正文行(非时长标签)用于"框内含正文 → 判为文本气泡"的质量门:
+            # 检测器阈值被降到 0.45 后, 短文本气泡也会混进语音气泡清单, 按顺序
+            # 插入后会把 音频段↔气泡 的位置配对整体错位。
+            text_hits = ocr_scanner.scan_text_hits(
+                self._ocr_cache_path, roi_offset=roi_offset)
         except Exception as e:
             self._logger.log("pipeline", "warning",
                              f"OCR语音气泡时长标签扫描失败: {e}")
-        self._audio_events = merge_ocr_and_vision(vision_events, ocr_hits)
+        vision_events = drop_text_bubbles(vision_events, text_hits,
+                                         duration_hits=ocr_hits)
+        self._ocr_text_hits = list(text_hits)
+        self._ocr_duration_hits = list(ocr_hits)
+        self._audio_events = merge_ocr_and_vision(
+            vision_events, ocr_hits,
+            media_duration_s=probe_media_duration(video_path))
+        if os.environ.get("DEBUG_VOICE_EVENTS"):
+            with open(os.path.join(self._output_dir, "voice_events.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump([{
+                    "first": e.timestamp, "last": e.last_timestamp,
+                    "box": e.box, "last_box": e.last_box,
+                    "side": e.side, "source": e.source,
+                } for e in self._audio_events], f, ensure_ascii=False, indent=1)
 
     def _merge_audio_into_result(self, result: dict) -> None:
         """等待后台转写线程结束, 把转写结果+气泡配对合并进结果 dict。
@@ -615,10 +716,95 @@ class ExtractionPipeline:
                 reason=str(self._audio_error) if self._audio_error else "音频未执行")
         if self._audio_error:
             transcript.reason = (transcript.reason or "") + f" (后台异常: {self._audio_error})"
+        # 视觉行锚点: 首见时刻 + 首见纵坐标(换算到原始帧坐标), 用于把语音行按
+        # 聊天顺序插入视觉行之间。OCR bbox 为 ROI 局部坐标, 气泡框是原始帧坐标,
+        # 必须加 ROI 顶部偏移, 否则两套坐标不在同一基准上。
+        # `doc` = 文档纵坐标(屏幕 y + 该时刻累计滚动偏移): 聊天滚动后行会整体上移,
+        # 只比较屏幕 y 会把"先出现但已滚到顶部"的行误判成最新消息, 必须消掉滚动量。
+        tracked = self._assembler.get_tracked_lines()
+        # 滚动偏移曲线取自**逐帧 OCR 原始行**(按文本跨帧配对): 跟踪行在滚动后会
+        # 重新建簇(ID 切换), 用它累计出的偏移只有真实值的一半左右。
+        # 缓存行的 bbox 是**各自裁图时那一版 ROI** 的局部坐标(预热期与稳态期的 ROI
+        # 原点不同), 先按帧还原到原始帧坐标再喂给曲线; 否则 ROI 切换点会凭空多出
+        # 一段假位移(实测 242px), 使文档坐标排序整体错乱。
+        ocr_frames = []
+        for fid, lines in self._ocr_cache.items():
+            if not lines:
+                continue
+            ox, oy = self._roi_origin(fid)
+            if ox or oy:
+                lines = [TextLine(text=l.text,
+                                  bbox=(l.bbox[0] + ox, l.bbox[1] + oy,
+                                        l.bbox[2], l.bbox[3]),
+                                  confidence=l.confidence,
+                                  frame_id=l.frame_id, timestamp=l.timestamp)
+                         for l in lines]
+            ocr_frames.append((float(lines[0].timestamp), lines))
+        ocr_frames.sort(key=lambda x: x[0])
+        # 图像侧帧级运动作为 OCR 单行配对不可信时的兜底(见 build_scroll_curve)。
+        scroll_curve = build_scroll_curve(
+            ocr_frames, image_curve=self._scroll_curve_img or None)
+        # 气泡清单(顺序对齐用): 由静止帧原始观测按文档坐标重建, 绕开滚动期的
+        # 跨帧身份错接; 再用与事件相同的正文质量门剔除文本气泡。
+        order_bubbles: List[object] = []
+        try:
+            clusters = cluster_static_observations(self._static_obs, scroll_curve)
+            order_bubbles = drop_narrow_bubbles(drop_text_bubbles(
+                clusters, self._ocr_text_hits,
+                duration_hits=self._ocr_duration_hits,
+                scroll_curve=scroll_curve))
+        except Exception as e:
+            self._logger.log("pipeline", "warning",
+                             f"静止观测聚类失败: {e}")
+        if os.environ.get("DEBUG_ORDER_BUBBLES"):
+            with open(os.path.join(self._output_dir, "order_bubbles.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump([{
+                    "t": ev.timestamp,
+                    # x 必须落盘: 正文质量门的 `_center_within` 同时判 x/y, 只看
+                    # y/w/h 无法复现"框住了正文却没被剔除"的判定(横向不匹配)。
+                    "x": ev.box[0] if getattr(ev, "box", None) else None,
+                    "y": ev.box[1] if getattr(ev, "box", None) else None,
+                    "w": ev.box[2] if getattr(ev, "box", None) else None,
+                    "h": ev.box[3] if getattr(ev, "box", None) else None,
+                    "side": ev.side,
+                    "conf": ev.confidence,
+                    "doc": (ev.stable_box[1] + scroll_offset_at(
+                        scroll_curve, ev.stable_timestamp))
+                    if getattr(ev, "stable_box", None) else None,
+                } for ev in order_bubbles], f, ensure_ascii=False, indent=1)
+        visual_lines = []
+        for ln in tracked:
+            box = ln.first_bbox or ln.bbox
+            if not box:
+                continue
+            # 语音气泡内的时长标签(如 6"…)会被 OCR 当正文行识别; 它不是消息,
+            # 进入锚点集合会把语音行插到它旁边(实测 doc 2388 造成整体错位)。
+            if parse_duration_seconds(ln.text) is not None:
+                continue
+            t0 = float(ln.first_timestamp)
+            # 跟踪行的 bbox 属于它**首见帧**那一版 ROI 的局部坐标(跨 ROI 切换时以
+            # 首见为准, 与 `box = first_bbox or bbox` 的取值口径一致)。
+            y0 = float(box[1]) + self._roi_origin(
+                ln.first_seen_frame if ln.first_bbox
+                else ln.last_seen_frame)[1]
+            visual_lines.append({"text": ln.text, "t": t0, "y": y0,
+                                 "doc": y0 + scroll_offset_at(scroll_curve, t0)})
+        if os.environ.get("DEBUG_SCROLL_CURVE"):
+            with open(os.path.join(self._output_dir, "scroll_curve.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"curve": scroll_curve,
+                           "frame_times": [t for t, _ in ocr_frames],
+                           "visual": visual_lines},
+                          f, ensure_ascii=False, indent=1)
         merge_into_result(
             result, transcript, self._audio_events,
             max_match_gap_s=self._safe_float(self._audio_cfg, "match_gap_s", 1.5),
             inject_chat=bool(self._audio_cfg.get("inject_chat", True)),
+            order_align=str(self._audio_cfg.get("order_align", "auto")),
+            visual_lines=visual_lines,
+            scroll_curve=scroll_curve,
+            order_bubbles=order_bubbles,
         )
 
     def _init_frames_dir(self, video_path: str) -> None:
@@ -715,6 +901,14 @@ class ExtractionPipeline:
                             "pipeline", "cache_load_skip",
                             f"缓存第{lineno}行JSON损坏, 跳过该行 / corrupt line skipped")
                         continue
+                    # 该条目的 bbox 所属 ROI 原点(旧缓存无此字段 → 回退当前 ROI)
+                    roi = item.get("roi")
+                    if roi and len(roi) == 2:
+                        try:
+                            self._frame_roi[int(item["fid"])] = (
+                                int(roi[0]), int(roi[1]))
+                        except (KeyError, TypeError, ValueError):
+                            pass
                     if item.get("kind") == "content":
                         # 内容指纹条目: 重建内容缓存(供同内容帧复用)
                         try:
@@ -770,6 +964,24 @@ class ExtractionPipeline:
                              f"缓存加载失败 / cache load failed: {e}")
             self._ocr_cache = {}
 
+    def _roi_origin(self, fid: int) -> Tuple[int, int]:
+        """该帧 OCR 行的 bbox 所属 ROI 原点 (x, y); 未记录时回退到当前 ROI。
+
+        为什么不能统一用终版 ROI / Why not one global offset:
+          自适应 ROI 在预热结束时把原点从 margin 基准挪到内容带(实测
+          `(0,60,576,1100)` → `(0,302,576,808)`), 而 OCR 缓存里的 bbox 是**裁图
+          当时**那一版 ROI 的局部坐标 —— 同一个文件里混着两套坐标系。用终版原点
+          换算全部帧, 会把预热期帧整体平移 242px: 正文质量门因此一个候选都剔不掉
+          (实测 `自行模拟对话记录4.mp4`: 10 个候选气泡全数保留, 其中 3 个是文本
+          气泡), 滚动曲线在切换点也凭空多出一段 242px 的假位移, 文档坐标排序随之
+          错乱(首屏文本行被排到语音行之后)。
+        """
+        r = self._frame_roi.get(fid)
+        if r:
+            return (int(r[0]), int(r[1]))
+        box = getattr(self._roi_manager, "roi_box", None)
+        return (int(box[0]), int(box[1])) if box else (0, 0)
+
     def _write_ocr_cache(self, fid: int, ts: float,
                          lines: List[TextLine]) -> None:
         """增量写OCR结果到缓存
@@ -792,6 +1004,9 @@ class ExtractionPipeline:
             item = {
                 "fid": fid,
                 "ts": round(ts, 3),
+                # bbox 所属的 ROI 原点: 缓存跨预热期/稳态期混用两套 ROI 局部坐标,
+                # 读取方必须按帧还原(见 `_roi_origin`)。
+                "roi": list(self._roi_origin(fid)),
                 "lines": [{
                     "text": t.text,
                     "bbox": list(t.bbox),
@@ -830,6 +1045,8 @@ class ExtractionPipeline:
                 "hash": h,
                 "fid": fid,
                 "ts": round(ts, 3),
+                # 同 _write_ocr_cache: 记录 bbox 所属的 ROI 原点
+                "roi": list(self._roi_origin(fid)),
                 "lines": [{
                     "text": t.text,
                     "bbox": list(t.bbox),
@@ -1371,7 +1588,12 @@ class ExtractionPipeline:
                                  frame_id=fid, timestamp=ts)
                         for t in src_lines
                     ]
+                    # 复用行的 bbox 沿用**源帧**的 ROI 局部坐标(盖章只改 fid/ts),
+                    # 故本帧的 ROI 原点记为源帧的, 否则跨预热/稳态复用时错位。
+                    self._frame_roi[fid] = self._roi_origin(src_fid)
                     self._store_result(fid, stamped)
+                    # 聊天/非聊天判定: 复用路径同样要打标, 否则非聊天帧会漏过门控
+                    self._mark_chat_scene(fid, ts, fd.roi_frame)
                     self._verdicts.put(
                         (fid, "ocr", ts, dedup_result, fd.mae_value,
                          content_h16, fd.pc_state)
@@ -1397,6 +1619,9 @@ class ExtractionPipeline:
             self._last_ocr_gray = fd.gray_small.copy()
             self._last_ocr_ts = ts
             self._frame_value.update_reference(fd.gray_small)
+            self._mark_chat_scene(fid, ts, fd.roi_frame)
+            # 记录裁图用的 ROI 原点: 该帧 OCR 行的 bbox 是这一版 ROI 的局部坐标
+            self._frame_roi[fid] = (int(fd.roi_box[0]), int(fd.roi_box[1]))
             self._submit_queue.put((fd.roi_frame, fid, ts, dedup_result))
             self._ocr_expected += 1
             self._verdicts.put((fid, "ocr", ts, dedup_result, fd.mae_value,
@@ -1433,6 +1658,8 @@ class ExtractionPipeline:
         self._last_ocr_gray = fd.gray_small.copy()
         self._last_ocr_ts = ts
         self._frame_value.update_reference(fd.gray_small)
+        self._mark_chat_scene(fid, ts, fd.roi_frame)
+        self._frame_roi[fid] = (int(fd.roi_box[0]), int(fd.roi_box[1]))
         self._submit_queue.put((fd.roi_frame, fid, ts, dedup_result))
         self._ocr_expected += 1
         self._verdicts.put((fid, "ocr", ts, dedup_result, fd.mae_value,
@@ -1482,7 +1709,7 @@ class ExtractionPipeline:
                     self._logger.log("pipeline", "ocr_submit_error",
                                      f"帧{fid} OCR失败 / OCR failed: {e}",
                                      frame_id=fid)
-                    self._store_result(fid, [])
+                    self._store_result(fid, [], failed=True)
             finally:
                 self._submit_queue.task_done()
 
@@ -1524,7 +1751,7 @@ class ExtractionPipeline:
                                      f"帧{fid} OCR返回空(重试{attempts - 1}次仍空), 存空 / "
                                      f"empty after {attempts - 1} retries",
                                      frame_id=fid)
-                    self._store_result(fid, [])
+                    self._store_result(fid, [], failed=True)
                     with self._inflight_cond:
                         self._inflight -= 1
                         self._inflight_cond.notify_all()
@@ -1540,7 +1767,7 @@ class ExtractionPipeline:
                     self._logger.log("pipeline", "ocr_submit_error",
                                      f"帧{fid} OCR重试提交失败 / retry submit failed: {e}",
                                      frame_id=fid)
-                    self._store_result(fid, [])
+                    self._store_result(fid, [], failed=True)
                     with self._inflight_cond:
                         self._inflight -= 1
                         self._inflight_cond.notify_all()
@@ -1581,8 +1808,15 @@ class ExtractionPipeline:
                 self._result_cond.wait(timeout=1.0)
             return self._results.pop(fid)
 
-    def _store_result(self, fid: int, lines: List[TextLine]) -> None:
-        """写入OCR结果并唤醒等待者"""
+    def _store_result(self, fid: int, lines: List[TextLine],
+                      failed: bool = False) -> None:
+        """写入OCR结果并唤醒等待者。
+
+        failed=True 表示该"空结果"来自OCR调用失败而非真实无文本, 标记后消费线程
+        不会把它写入断点缓存/内容指纹缓存。
+        """
+        if failed:
+            self._ocr_failed_fids.add(fid)
         with self._result_cond:
             self._results[fid] = list(lines) if lines else []
             self._result_cond.notify_all()
@@ -1620,6 +1854,26 @@ class ExtractionPipeline:
                     :len(self._pending_rois) - self._pending_rois_max]:
                 del self._pending_rois[k]
 
+    def _mark_chat_scene(self, fid: int, ts: float, roi_frame) -> None:
+        """判定该帧是否为聊天界面并暂存结果(供消费线程查用)。
+
+        非聊天帧(转账回单/银行页/设置页/长按菜单等)整帧丢弃其OCR行, 从入口
+        挡住非聊天内容污染正文; 非聊天判定会写行为日志(便于回溯)。
+        """
+        if not self._chat_scene_filter:
+            return
+        is_chat, reason = chat_scene_reason(roi_frame, self._chat_wall_ratio)
+        self._frame_chat[fid] = is_chat
+        if len(self._frame_chat) > self._frame_chat_max:
+            for k in sorted(self._frame_chat)[
+                    :len(self._frame_chat) - self._frame_chat_max]:
+                del self._frame_chat[k]
+        if not is_chat:
+            self._logger.log(
+                "pipeline", "non_chat_frame",
+                f"帧{fid}({ts:.1f}s): 非聊天界面({reason}), 丢弃该帧OCR行",
+                frame_id=fid, extra={"reason": reason})
+
     def _apply_pending_keyframe_resets(self) -> None:
         """执行消费线程请求的keyframe重置(用灰度缓存)"""
         with self._reset_lock:
@@ -1654,13 +1908,24 @@ class ExtractionPipeline:
           - 日期分隔: 整行恰为"x月x日"/"2026年8月20日"/"08-20"等 → 丢弃
           - 顶部条带: 位于ROI顶部条带内且非消息气泡对齐(既非贴左缘也非贴右缘)
             且(短文本/含装饰字符/水平居中) → 标题栏/在线状态 → 丢弃
+          - 语音气泡时长标签(如 "5\" ((")/长按菜单文案(如"转文字")/撤回提示条
+            (如"你撤回了一条消息"): 界面元素/系统通知 → 丢弃
         online status and date separators (e.g. "五月4") are dialog/OS chrome,
           - Date separator: whole line is "x月x日"/"2026年8月20日"/"08-20" → drop
         """
         cleaned = []
         # 顶部UI条带高度: 标题栏+在线状态所在区域(按ROI高度比例, 带最小像素)
-        strip_h = (min(_UI_STRIP_RATIO * roi_h, _UI_STRIP_MIN_PX)
+        strip_h = (max(_UI_STRIP_RATIO * roi_h, _UI_STRIP_MIN_PX)
                    if roi_h > 0 else 0)
+        # 菜单簇判定(帧级): 同一帧出现 >=2 个"可能与正文同形"的菜单文案时,
+        # 判定为长按菜单展开 → 这些文案一并丢弃(单条出现时保留, 防误杀正文)。
+        ambiguous_hits = sum(1 for ln in lines
+                             if (ln.text or "").strip() in _UI_LABEL_AMBIGUOUS)
+        menu_cluster = ambiguous_hits >= 2
+        # 系统弹窗簇判定(帧级): 同一帧出现系统对话框正文时, 其按钮文案("开启"/
+        # "取消"等)也一并丢弃 —— 按钮单独出现时保留, 防误杀正文。
+        sys_dialog_cluster = any(_SYS_DIALOG_RE.search((ln.text or "").strip())
+                                 for ln in lines)
         for ln in lines:
             t = (ln.text or "").strip()
             if not t:
@@ -1668,6 +1933,21 @@ class ExtractionPipeline:
             # 时间戳行(如"23:53" / "00:00√")保留, 后续做时间戳分离
             if re.fullmatch(r"\d{1,2}:\d{2}\s*√?\s*", t):
                 cleaned.append(ln)
+                continue
+            # 语音气泡时长标签(如 "5\" ((" / ") 4\"") : 气泡元信息, 丢弃
+            if _is_voice_badge(t):
+                continue
+            # 长按菜单/操作按钮文案 + 撤回提示条: 界面元素/系统通知, 丢弃
+            if t in _UI_LABEL_ALWAYS:
+                continue
+            if menu_cluster and t in _UI_LABEL_AMBIGUOUS:
+                continue
+            if _RECALL_NOTICE_RE.fullmatch(t):
+                continue
+            # 系统弹窗正文 + 其按钮文案(同帧成簇): 系统 UI, 丢弃
+            if _SYS_DIALOG_RE.search(t):
+                continue
+            if sys_dialog_cluster and t in _DIALOG_BUTTONS:
                 continue
             # 日期分隔条(如"五月4"/"2026年8月20日"/"08-20"): 界面元素, 丢弃
             if _DATE_DIVIDER_RE.fullmatch(t):
@@ -1722,8 +2002,8 @@ class ExtractionPipeline:
             # 纯时间/数字残片(如"23:"), 非完整时间戳
             if re.fullmatch(r"[\d:：.\-]+", t):
                 continue
-            # 低置信度乱码
-            if ln.confidence < 0.5:
+            # 低置信度乱码: 统一最低置信度兜底(见 _ocr_min_conf)
+            if ln.confidence < self._ocr_min_conf:
                 continue
             if scroll_frame:
                 # 滚动帧: 残影识别置信度更低, 用更高阈值
@@ -1749,6 +2029,11 @@ class ExtractionPipeline:
         """
         self._inc_stats("frames_ocr_processed", 1)
 
+        # 该帧OCR调用是否失败(空结果是故障产物而非真实无文本)。失败的帧一律不写
+        # 缓存, 否则重放会命中被固化的空结果, 让视觉通道静默归零。
+        ocr_failed = fid in self._ocr_failed_fids
+        self._ocr_failed_fids.discard(fid)
+
         # 断点续传: 新OCR帧增量落盘(保存原始OCR结果, 仲裁在重放时重跑)
         # 滚动帧判定: 帧间变化速度超过静止阈值 → 内容残片/错字, 先过滤再入缓存
         # 相位相关启用时: 只有真实滚动位移(scrolling)才启用滚动过滤; 内容替换
@@ -1760,14 +2045,27 @@ class ExtractionPipeline:
         # ROI尺寸供界面元素(标题栏/在线状态/日期分隔)过滤
         roi_box = self._roi_manager.roi_box
         roi_w, roi_h = (roi_box[2], roi_box[3]) if roi_box else (0, 0)
+        # 聊天/非聊天界面分离: 非聊天帧(转账回单/银行页/设置页/长按菜单等)的
+        # OCR行整帧丢弃, 且不进入跟踪/状态机/组装(避免非聊天界面误触发内容缺口);
+        # 仅落一份空OCR缓存, 保证断点重放结果一致。
+        if self._chat_scene_filter and not self._frame_chat.pop(fid, True):
+            self._inc_stats("frames_non_chat_skipped", 1)
+            if fid not in self._ocr_cache and not ocr_failed:
+                self._write_ocr_cache(fid, ts, [])
+                self._ocr_cache[fid] = []
+            print(f"[OCR] 帧{fid}: 非聊天界面, 丢弃{len(ocr_lines)}行", flush=True)
+            self._emit("ocr_frame", frame_id=fid, timestamp=round(ts, 2),
+                       lines=[], scroll_frame=scroll_frame)
+            return
         ocr_lines = self._clean_ocr_lines(
             ocr_lines, scroll_frame=scroll_frame, roi_w=roi_w, roi_h=roi_h)
-        if fid not in self._ocr_cache:
-            self._write_ocr_cache(fid, ts, ocr_lines)
-            self._ocr_cache[fid] = list(ocr_lines)
+        if not ocr_failed:
+            if fid not in self._ocr_cache:
+                self._write_ocr_cache(fid, ts, ocr_lines)
+                self._ocr_cache[fid] = list(ocr_lines)
 
-        # 内容指纹缓存: 该帧内容入缓存, 供后续同内容帧复用OCR结果
-        self._update_content_cache(content_h16, fid, ts, ocr_lines)
+            # 内容指纹缓存: 该帧内容入缓存, 供后续同内容帧复用OCR结果
+            self._update_content_cache(content_h16, fid, ts, ocr_lines)
 
         is_gray_zone = (dedup_result.confidence_tier == ConfidenceTier.GRAY_ZONE)
         if is_gray_zone:
@@ -1923,6 +2221,7 @@ class ExtractionPipeline:
             self._sampler.set_roi_box(new_roi)
             self._text_tracker.set_roi_dimensions(new_roi[3], new_roi[2])
             self._assembler.set_roi_width(new_roi[2])
+            self._assembler.set_roi_height(new_roi[3])
             self._logger.log("pipeline", "roi_adaptive",
                              f"自适应ROI生效: {old_roi} -> {new_roi}")
             self._emit("stage", stage="roi",

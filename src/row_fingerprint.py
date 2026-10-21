@@ -170,6 +170,16 @@ class RowFingerprintAligner:
         self._lib_enabled: bool = bool(config.get("rf_lib_enabled", True))
         self._lib_max: int = int(config.get("rf_lib_max", 2000))
         self._lib_match_hd: int = int(config.get("rf_lib_match_hd", 6))
+        # 稀疏条带的"退化"墨水占比下限(暗像素占条带比例)。占比低于此值的条带
+        # 几乎全是背景, 其 dHash 由压缩噪声而非文字决定 → 与库中任意背景行都能
+        # 在模糊半径内碰撞(实测: 仅有一个 3 字短气泡的条带 ink=0.004, 与库行
+        # hd=5 假碰撞), 使真正的新短消息被当成"回看"剔除 → 漏检。故退化条带
+        # 只认**精确**命中(hd==0), 不做模糊近邻匹配。
+        # Degenerate-strip ink floor: a strip below this dark-pixel ratio is almost
+        # pure background, so its dHash is decided by compression noise, not glyphs,
+        # and fuzzily collides with any background row in the library. Such strips
+        # are matched exactly (hd==0) only.
+        self._degenerate_ink: float = float(config.get("rf_degenerate_ink", 0.01))
         self._logger = logger
 
         # 关键帧指纹序列队列(最近N帧)
@@ -231,8 +241,14 @@ class RowFingerprintAligner:
                 best_s = s
         return best_s
 
-    def _extract_sequence(self, roi_frame: np.ndarray) -> List[int]:
-        """把帧编码为行指纹序列(相位归一化: 先估相位再切条带)"""
+    def _extract_sequence(self, roi_frame: np.ndarray
+                          ) -> Tuple[List[int], List[float]]:
+        """把帧编码为行指纹序列(相位归一化: 先估相位再切条带)
+
+        同时返回每条带的墨水占比(暗像素占条带比例), 供滚动记忆库区分"有内容的
+        条带"与"退化的近空条带"(见 _degenerate_ink)。
+        / Returns (row fingerprints, per-strip dark-pixel ratios).
+        """
         gray = to_gray(roi_frame)
         h, w = gray.shape[:2]
         scale = self._compute_w / w
@@ -242,7 +258,8 @@ class RowFingerprintAligner:
         phase = self._estimate_text_phase(small) if self._phase_enabled else 0
         self._last_phase = phase
         n = max(1, (small_h - phase) // H)
-        seq = []
+        seq: List[int] = []
+        inks: List[float] = []
         for i in range(n):
             y0 = phase + i * H
             strip = small[y0: y0 + H]
@@ -250,18 +267,25 @@ class RowFingerprintAligner:
                 strip = np.pad(strip, ((0, H - strip.shape[0]), (0, 0)),
                                mode="edge")
             seq.append(compute_dhash(strip, self._dhash_size))
-        return seq
+            inks.append(float(np.mean(strip < 128)))
+        return seq, inks
 
     # ------------------------------------------------------------------
     # 滚动记忆累积库(位移/窗口免疫的新颖度判据)
     # ------------------------------------------------------------------
 
-    def _row_seen_in_lib(self, fp: int) -> bool:
+    def _row_seen_in_lib(self, fp: int, ink: float) -> bool:
         """该行指纹是否已在累积库中有近邻(滚动往返去重)。
         先做精确匹配(快路径), 再按噪声半径做模糊近邻(秒同内容微量扰动)。
+        退化条带(ink < _degenerate_ink, 几乎无内容)只认精确匹配: 其 dHash 由
+        噪声决定, 模糊近邻会把新短消息的背景条带误判成"已见"。
+        / Degenerate (near-empty) strips match exactly only; their dHash carries
+        no glyph signal and fuzzy matching there yields false "seen" collisions.
         """
         if fp in self._seen_rows:
             return True
+        if ink < self._degenerate_ink:
+            return False
         if not self._lib_match_hd or not self._seen_rows:
             return False
         r = self._lib_match_hd
@@ -281,7 +305,7 @@ class RowFingerprintAligner:
                 return
             self._seen_rows.add(fp)
 
-    def _filter_seen_rows(self, seq: List[int],
+    def _filter_seen_rows(self, seq: List[int], inks: List[float],
                           new_rows: List[int]) -> Tuple[List[int], int]:
         """把"相对窗口是新的、但累积库中早已见过"的重现/回看行剔除。
         返回 (过滤后的新行, 剔除的复现行数)。这就是位移/窗口免疫的实质——
@@ -292,7 +316,7 @@ class RowFingerprintAligner:
         kept: List[int] = []
         dropped = 0
         for cj in new_rows:
-            if self._row_seen_in_lib(seq[cj]):
+            if self._row_seen_in_lib(seq[cj], inks[cj]):
                 dropped += 1
             else:
                 kept.append(cj)
@@ -409,7 +433,7 @@ class RowFingerprintAligner:
 
         首帧视为关键帧并返回 dup(全匹配)。
         """
-        seq = self._extract_sequence(roi_frame)
+        seq, inks = self._extract_sequence(roi_frame)
         if not self._keyframes:
             self._keyframes.append(seq)
             self._last_sequence = seq
@@ -432,7 +456,7 @@ class RowFingerprintAligner:
         # 滚动记忆过滤: 把"相对窗口是新、但累积库早已见过"的回看/复现行剔除。
         # 这使得新颖度对"全片记忆+位移对齐"判定, 滚动往返/长滚回看不再反复OCR。
         raw_new_count = len(new_rows)
-        new_rows, dropped_revisit = self._filter_seen_rows(seq, new_rows)
+        new_rows, dropped_revisit = self._filter_seen_rows(seq, inks, new_rows)
 
         # 判定: 有实质新行 → 至少送OCR(gray/new); 无新行且高对齐 → dup。
         if new_rows:
@@ -470,7 +494,7 @@ class RowFingerprintAligner:
 
     def update_keyframe(self, roi_frame: np.ndarray) -> None:
         """更新关键帧指纹序列(入队, 保留最近N帧), 并把内容行并入滚动记忆库"""
-        seq = self._extract_sequence(roi_frame)
+        seq, _inks = self._extract_sequence(roi_frame)
         # 与最近关键帧相同则跳过(重复关键帧无信息量)
         if not self._keyframes or seq != self._keyframes[-1]:
             self._keyframes.append(seq)
@@ -482,7 +506,7 @@ class RowFingerprintAligner:
 
     def force_update(self, roi_frame: np.ndarray) -> None:
         """强制更新关键帧(如状态恢复后): 清空窗口历史并重设, 保留滚动记忆库"""
-        seq = self._extract_sequence(roi_frame)
+        seq, _inks = self._extract_sequence(roi_frame)
         self._keyframes = [seq]
         self._commit_subsequences(seq)   # 恢复后的当前内容也纳入滚动记忆
         self._last_sequence = seq

@@ -48,6 +48,17 @@ class VoiceEvent:
     box: Optional[Tuple[float, float, float, float]] = None   # (x, y, w, h)
     # 来源方式: 'vision'(视觉形状) / 'ocr'(OCR时长标签信号) / 'hybrid'(已合并)
     source: str = "vision"
+    # OCR 时长标签(audio_duration)解析出的语音真实播放时长(秒), 供切段精确用。
+    # 若为 None, 抽取时回退用 (end_time - timestamp) 气泡停留时长。
+    audio_duration: Optional[float] = None
+    # 最后一次在屏上的观测(时刻 + 框)。滚动/追加会把气泡整体平移, 首见位置是
+    # "中途某一屏"的临时坐标; 只有**稳定停留后**的位置才能与同一屏的文本行比较。
+    last_timestamp: Optional[float] = None
+    last_box: Optional[Tuple[float, float, float, float]] = None
+    # 第一次"屏幕静止"时的观测(时刻 + 框)。静止帧上测得的 y 才与同一时刻的滚动
+    # 偏移曲线共基准; 滚动途中的观测会与曲线错位一整步滚动量。
+    stable_timestamp: Optional[float] = None
+    stable_box: Optional[Tuple[float, float, float, float]] = None
 
 
 @dataclass

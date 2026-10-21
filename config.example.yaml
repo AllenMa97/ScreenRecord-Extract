@@ -112,6 +112,7 @@ visual_dedup:
   rf_lib_enabled: true
   rf_lib_max: 2000
   rf_lib_match_hd: 6
+  rf_degenerate_ink: 0.01
 
 ocr:
   mode: "api"                       # "api" / "local" / "mock"
@@ -131,6 +132,12 @@ text_tracker:
   line_expire_seconds: 3.0
   voting_window: 5
   center_distance_ratio: 0.15
+  iou_strong_threshold: 0.6         # "同一框"判定 / "same box" IoU
+  text_sim_strong_threshold: 0.50   # 同一框内放宽的文本门限 / relaxed text sim inside same box
+  dormant_rematch_frames: 10        # 休眠行需强空间证据 / dormant rows need strong spatial evidence
+  template_digit_guard_sim: 0.90    # 数字锚点守卫(0 关闭) / digit-anchor guard (0 disables)
+  reattach_grace_seconds: 3.0       # 过期行重挂宽限 / re-attach grace
+  adjacent_gap_ratio: 1.0           # 相邻行排他仲裁(0 关闭) / adjacent-row exclusivity (0 disables)
 
 state_machine:
   min_text_lines: 3

@@ -92,12 +92,32 @@ class OcrClient:
 
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:
-        """是否为可重试错误(限流/服务端/网络)"""
+        """是否为可重试错误(限流/服务端/网络/提交队列满)。
+
+        AI Studio 在提交队列拥塞时返回 **HTTP 400 + code 10010**
+        ("任务提交队列已满，请稍后重试")。语义上属于可重试的限流, 但状态码并非
+        429, 只看状态码会把它当成不可重试错误直接抛出 → 整轮 OCR 被瞬时拥塞
+        打成 0 行(静默产出空结果)。故对 400 需按响应体识别。
+
+        / AI Studio returns HTTP 400 + code 10010 ("submission queue is full,
+        retry later") under congestion. It is a retryable rate-limit despite not
+        being 429; treat it as such, otherwise a transient hiccup silently
+        yields a zero-line OCR result.
+        """
         import requests
 
         if isinstance(exc, requests.HTTPError):
-            status = exc.response.status_code if exc.response is not None else 0
-            return status in (429, 500, 502, 503, 504)
+            resp = exc.response
+            status = resp.status_code if resp is not None else 0
+            if status in (429, 500, 502, 503, 504):
+                return True
+            if status == 400 and resp is not None:
+                try:
+                    body = resp.text or ""
+                except Exception:
+                    body = ""
+                return "10010" in body or "队列已满" in body
+            return False
         return isinstance(exc, (requests.ConnectionError, requests.Timeout))
 
     def _with_retry(self, fn, frame_id: int, what: str):

@@ -44,9 +44,12 @@ from src.message_bubble_tracker import MessageBubbleTracker
 from src.state_machine import StateMachine, SystemState
 from src.semantic_dedup import SemanticDedup, SemanticVerdict
 from src.data_types import TextLine, TrackedLine
-from src.pipeline import ExtractionPipeline
+from src.pipeline import ExtractionPipeline, _is_voice_badge
 from src.llm_client import LlmClient
 from src.bubble_merger import merge_wrapped_lines
+from src.audio.data_types import VoiceEvent, VoiceUtterance
+from src.audio.transcriptor import TranscriptResult
+from src.audio.report_merge import merge_into_result
 from src.screenshot_filter import (
     detect_screenshot_clusters, collapse_screenshot_clusters,
     _norm_shot_parts
@@ -664,6 +667,62 @@ def test_text_utils() -> bool:
     iou_ok = abs(iou - 1.0) < 0.01 and abs(iou2) < 0.01
 
     passed = ed_ok and sim_ok and iou_ok
+    print(f"  结果: {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
+def test_ui_noise_filter() -> bool:
+    """测试界面噪声过滤: 语音气泡时长标签/长按菜单文案/撤回提示条
+    Test UI-noise filtering: voice-bubble duration badges, long-press menu
+    labels and recall notices must be dropped, while real messages survive."""
+    print("\n[NLP] 测试界面噪声过滤 / Testing UI Noise Filter...")
+
+    class _Stub:
+        _scroll_conf = 0.65
+        _ocr_min_conf = 0.85
+
+    roi_w, roi_h = 432, 780
+
+    def clean(texts, scroll_frame=False):
+        lines = [TextLine(text=t, bbox=(20, 200, 200, 220), confidence=0.99)
+                 for t in texts]
+        out = ExtractionPipeline._clean_ocr_lines(
+            _Stub(), lines, scroll_frame=scroll_frame, roi_w=roi_w, roi_h=roi_h)
+        return [ln.text for ln in out]
+
+    # 1) 语音气泡时长标签 → 全丢 / voice badges -> all dropped
+    badges = ['5" ((', ') 4"', '18" (', '4° (', ')3"', '5" (6', ') 5"']
+    dropped = clean(badges)
+    badge_ok = dropped == []
+    print(f"  时长标签 {badges} -> 保留 {dropped} (期望[])")
+    print(f"  判据 _is_voice_badge: {[_is_voice_badge(b) for b in badges]} (期望全 True)")
+
+    # 2) 撤回提示条 → 丢弃 / recall notice -> dropped
+    recall_ok = clean(["你撤回了一条消息", "对方撤回了一条消息"]) == []
+
+    # 3) 菜单文案: "转文字"恒丢; 单个"删除"保留(防误杀); 同帧≥2个菜单文案→成簇全丢
+    always_ok = clean(["转文字"]) == []
+    single_ok = clean(["删除"]) == ["删除"]
+    cluster_ok = clean(["删除", "收藏", "引用"]) == []
+
+    # 4) 真实消息必须保留(含数字/百分号/URL/文件名)
+    keep = ["收到，辛苦",
+            "您的快递 7741 已到驿站，请凭取件码签收",
+            "换了，http://10.20.30.41:8080/api/v1 这个是新的",
+            "有，我导出成 ticket-20261015-0037.csv 了",
+            "另外那个偶现问题又出现了，大约 0.3% 的概率会超时"]
+    kept = clean(keep)
+    keep_ok = kept == keep
+    print(f"  真实消息保留: {kept}")
+    print(f"  转文字丢弃={always_ok} 单个'删除'保留={single_ok} 菜单簇丢弃={cluster_ok}")
+
+    # 5) 系统弹窗: 对话框正文恒丢; 同帧按钮一并丢弃; 按钮单独出现时保留(防误杀)
+    dlg_ok = clean(['电量剩余20%是否开启“省电模式”？', '开启']) == []
+    btn_only_ok = clean(['开启']) == ['开启']
+    print(f"  系统弹窗丢弃={dlg_ok} 单独按钮保留={btn_only_ok}")
+
+    passed = (badge_ok and recall_ok and always_ok and single_ok
+              and cluster_ok and keep_ok and dlg_ok and btn_only_ok)
     print(f"  结果: {'PASS' if passed else 'FAIL'}")
     return passed
 
@@ -1396,6 +1455,126 @@ def test_screenshot_filter() -> bool:
     return passed
 
 
+def test_audio_report_merge() -> bool:
+    """测试音频转写与语音气泡的配对 / 注入 / Test voice-event pairing & injection.
+
+    覆盖 report_merge 的四个关键约定 / Covers four key contracts:
+      1. 气泡级聚合文本(整簇拼接)保留在 voice_events 里
+         Bubble-level aggregated text stays in voice_events.
+      2. 注入按**转写段(一句一行)**进行: 一个气泡时间窗横跨多条 ASR 段时,
+         必须拆成多行各自成条, 不能粘成一条(跨消息误并的根因)
+         Injection is per-segment: a bubble whose window spans several ASR
+         segments must yield one line each, never glued into one line.
+      3. 空文本段不注入(整段静音/无有效人声)
+         Empty-text segments are never injected.
+      4. 视觉×音频跨路去重: 屏幕已有同一句时不再重复注入, 但数字锚点不同的
+         模板同形消息必须都保留 / cross-path dedup by digit-anchored similarity.
+    """
+    print("\n[NLP] 测试音频报告合并 / Testing Audio Report Merge...")
+    fails = 0
+
+    # 一个气泡(5.0s)时间窗横跨 seg0/seg1; seg2 为空文本(应被剔除);
+    # 另一个气泡(66.0s)横跨 seg3/seg4; 一个 200s 的气泡无任何段可配。
+    segments = [
+        VoiceUtterance(4.0, 6.0, "在吗？明天上午的评审会，你参加吗？"),
+        VoiceUtterance(6.2, 8.0, "在的我先看一下日程"),
+        VoiceUtterance(9.0, 11.0, ""),
+        VoiceUtterance(65.0, 67.0, "顺便问一下测试环境地址换新了吗"),
+        VoiceUtterance(67.2, 69.0, "好的，我更新一下本地配置"),
+    ]
+    events = [
+        VoiceEvent(timestamp=5.0, end_time=8.0, side="收", confidence=0.9,
+                   matched_text="00:04"),
+        VoiceEvent(timestamp=66.0, end_time=69.0, side="收", confidence=0.9),
+        VoiceEvent(timestamp=200.0, end_time=203.0, side="发", confidence=0.9),
+    ]
+    result = {
+        "sections": [
+            {"timestamp": 0.0, "content": "- +0s [收] ：十点我得先去一趟实验室"},
+            {"timestamp": 60.0, "content": "- +60s [收] ：已经在改了，下午3点前发你"},
+        ],
+    }
+    transcript = TranscriptResult(source="test", duration=210.0, has_audio=True,
+                                  segments=segments, vad_utterances=5)
+    merge_into_result(result, transcript, events)
+
+    def lines_of(i):
+        return result["sections"][i]["content"].split("\n")
+
+    # ---- 约定1: 气泡级聚合文本仍在 voice_events 里 ----
+    ve = result["voice_events"]
+    agg = ve[0]["text"]
+    ok1 = agg == "在吗？明天上午的评审会，你参加吗？在的我先看一下日程"
+    ok1 = ok1 and ve[0]["matched"] and ve[0]["consumed_ids"] == [0, 1]
+    print(f"  [aggregate] voice_events 保留整簇文本={ok1}")
+    if not ok1:
+        fails += 1
+        print("    实际:", agg, ve[0]["consumed_ids"])
+
+    # ---- 约定2: 逐段注入, 不得粘成一行 ----
+    voice0 = [l for l in lines_of(0) if "[语音]" in l]
+    voice1 = [l for l in lines_of(1) if "[语音]" in l]
+    expect0 = [
+        "- +4s [语音] [收] ：在吗？明天上午的评审会，你参加吗？",
+        "- +6s [语音] [收] ：在的我先看一下日程",
+    ]
+    expect1 = [
+        "- +65s [语音] [收] ：顺便问一下测试环境地址换新了吗",
+        "- +67s [语音] [收] ：好的，我更新一下本地配置",
+    ]
+    ok2 = voice0 == expect0 and voice1 == expect1
+    # 原视觉行必须保留在注入行之前
+    ok2 = ok2 and lines_of(0)[0].startswith("- +0s [收] ：十点")
+    ok2 = ok2 and lines_of(1)[0].startswith("- +60s [收] ：已经在改了")
+    print(f"  [per_segment] 逐段成行={ok2}")
+    if not ok2:
+        fails += 1
+        print("    实际 section0:", voice0)
+        print("    实际 section1:", voice1)
+
+    # ---- 约定3: 空文本段不注入 & 未配对气泡不注入 ----
+    all_voice = voice0 + voice1
+    ok3 = len(all_voice) == 4
+    ok3 = ok3 and not any(l.rstrip().endswith("：") for l in all_voice)
+    ok3 = ok3 and ve[2]["matched"] is False and ve[2]["text"] == ""
+    ok3 = ok3 and ve[2]["consumed_ids"] == []
+    print(f"  [empty_unmatched] 空段/未配对不注入={ok3}")
+    if not ok3:
+        fails += 1
+        print("    实际:", all_voice, ve[2])
+
+    # ---- 约定4: 视觉×音频跨路去重(同一句两路各出一份时只保留视觉那条) ----
+    # 屏幕上已有同一句(视觉行)→ 不再注入音频行; 数字锚点不同(8812/8814)的
+    # 模板同形消息是两条不同消息 → 必须都保留。
+    result2 = {
+        "sections": [
+            {"timestamp": 0.0,
+             "content": "- 18:57 [收] ：在吗？明天上午的评审会，你参加吗？\n"
+                        "- 18:57 [收] ：您的快递 8812 已到驿站，请凭取件码签收"},
+        ],
+    }
+    tr2 = TranscriptResult(
+        source="test", duration=30.0, has_audio=True, vad_utterances=2,
+        segments=[
+            VoiceUtterance(4.0, 6.0, "在吗？明天上午的评审会，你参加吗？"),
+            VoiceUtterance(20.0, 22.0, "您的快递8814已到驿站，请凭取件码签收"),
+        ])
+    ev2 = [VoiceEvent(timestamp=5.0, end_time=6.0, side="收", confidence=0.9),
+           VoiceEvent(timestamp=21.0, end_time=22.0, side="收", confidence=0.9)]
+    merge_into_result(result2, tr2, ev2)
+    l2 = [l for l in result2["sections"][0]["content"].split("\n") if "[语音]" in l]
+    ok4 = len(l2) == 1 and "8814" in l2[0]
+    ok4 = ok4 and result2["statistics"].get("voice_cross_path_dups") == 1
+    print(f"  [cross_path_dup] 跨路去重(保留8814那条)={ok4}")
+    if not ok4:
+        fails += 1
+        print("    实际:", l2, result2["statistics"].get("voice_cross_path_dups"))
+
+    passed = fails == 0
+    print(f"  结果: {'PASS' if passed else 'FAIL'}")
+    return passed
+
+
 def main():
     print("=" * 60)
     print("手机录屏内容提取 - 冒烟测试 / Smoke Test")
@@ -1426,8 +1605,10 @@ def main():
 
     # NLP测试 / NLP tests
     results["text_utils"] = test_text_utils()
+    results["ui_noise_filter"] = test_ui_noise_filter()
     results["assembly_equiv"] = test_assembly_equivalence()
     results["bubble_merger"] = test_bubble_merger()
+    results["audio_report_merge"] = test_audio_report_merge()
     results["screenshot_filter"] = test_screenshot_filter()
     results["text_tracker"] = test_text_tracker(config.text_tracker, logger)
 

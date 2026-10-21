@@ -53,10 +53,20 @@
               :type="ev.source === 'hybrid' ? 'primary' : 'warning'"
             >{{ ev.source === 'hybrid' ? '视觉+OCR' : (ev.source === 'ocr' ? 'OCR信号' : '视觉侧') }}</el-tag>
             <span class="voice-side">[{{ ev.side || '未知' }}]</span>
-            <span v-if="ev.duration" class="voice-dur">时长 {{ ev.duration }}</span>
+            <el-tag v-if="ev.audio_duration" size="small" type="info" effect="plain">
+              语音 {{ fmtClock(ev.audio_duration) }}
+            </el-tag>
             <span class="voice-time" title="该语音气泡在视频中的位置（第几分几秒）">视频 {{ fmtClock(ev.timestamp) }}</span>
             <span class="voice-conf">置信度 {{ (ev.confidence * 100).toFixed(0) }}%</span>
           </div>
+          <audio
+            v-if="ev.audio_url"
+            :src="voiceUrl(ev.audio_url)"
+            class="voice-audio"
+            controls
+            preload="none"
+            controlslist="nodownload"
+          ></audio>
           <div v-if="ev.text" class="voice-text">{{ ev.text }}</div>
           <div v-else class="voice-text muted">
             (检测到语音气泡，但对应声音未被录屏采集)
@@ -140,6 +150,13 @@ const audioHasData = computed(() => !!audio.value)
 const matchedCount = computed(() =>
   voiceEvents.value.filter((e) => e.matched).length
 )
+
+// 把后端回填的 audio_url(如 /api/sessions/{sid}/voices/xxx.wav)转成可播放的完整地址
+// audio_url is an API path; voiceUrl maps it to a playable URL (browser origin).
+function voiceUrl(path) {
+  if (!path) return ''
+  return path
+}
 
 // 音频状态判别(与 ResultPanel 保持一致) / audio status classification
 const statusCard = computed(() => {
@@ -265,6 +282,11 @@ const statusCard = computed(() => {
 .voice-side { font-size: 12px; color: var(--el-text-color-regular); }
 .voice-time { font-size: 12px; color: var(--el-text-color-secondary); font-family: Consolas, monospace; }
 .voice-conf { font-size: 11px; color: var(--el-text-color-placeholder); margin-left: auto; }
+.voice-audio {
+  margin-top: 6px;
+  width: 100%;
+  height: 30px;
+}
 .voice-text {
   margin-top: 5px;
   font-size: 13px;

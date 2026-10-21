@@ -4,6 +4,15 @@
 A CPU-friendly algorithm framework for extracting chat records
 and parameters from phone screen recordings.
 
+**双通道 + 无需训练数据 / Two channels, no training data**:
+- **视觉文本通道**: 自适应抽帧 → ROI/模糊/视觉去重 → OCR → 空间感知行跟踪(跨帧投票)
+  → 折行合并 → 组装, 输出带 `[发]/[收]` 与时间戳的结构化聊天记录;
+  CV+OCR(+可选 LLM 仲裁/纠错), 全部为经典算法, **CPU 可跑、无 GPU 依赖**。
+- **音频通道**(§12): 语音消息在屏幕上没有文字, 故用「VAD 切段 → 并发 ASR」拿转写,
+  再用轻量 CV 检测出的**语音气泡事件**做时间锚点配对, 逐条注入聊天流水, 并支持
+  Web 端逐条审听。
+- **Web 可视化**: FastAPI + Vue3, 上传录屏即可看进度、聊天段落与逐条语音。
+
 ## 核心算法 / Core Algorithms
 
 ### 1. 保召回自适应步长采样 / Recall-First Adaptive-Step Sampling
@@ -47,8 +56,24 @@ Maintains sliding window baseline; current frame below 30% of baseline is blurry
 **替代整帧LCS拼接的关键创新** / Key innovation replacing whole-frame LCS:
 - 利用OCR返回的bbox坐标, 逐行跨帧跟踪
 - bbox IoU + 文本相似度组合匹配
-- 多帧投票纠正OCR错误
+- 多帧投票纠正OCR错误: **字符级共识**(`utils/text_consensus.py`)而非整行多数表决
+  —— 旧做法"错一个字就变成另一张票", 现按位加权投票, 逐位需严格多数才改动
 - 利用空间信息判断哪些行是新内容
+- **数字锚点守卫 / digit-anchor guard**: 模板消息(`订单SN0010已确认收款` vs
+  `订单SN0014已确认收款`)文字部分完全一致、只有数字位不同 → 编辑距离相似度高达
+  0.91, 任何相似度判据都分不开。聊天消息高度统一时, 滚动一整条会让**下一条**消息
+  IoU≈1 地落进上一条的框, 休眠/宽限行便把它吸收并整行改判, 使后出现的消息继承更早
+  的时间戳(输出顺序颠倒)。故再加一道判据: 观测与本行外观库**全部**文本都构成
+  "骨架相似度≥0.90 但数字锚点不相容"时判为另一条消息, 拒绝吸收, 让它自建新行
+  (`text_tracker.template_digit_guard_sim`, 置 0 关闭)。热行不受限 —— 其数字差异
+  更可能是 OCR 噪声, 应留给投票层吸收。
+  Template messages differing only in digits score ≈0.91 on edit-distance
+  similarity; with uniform message heights a full-line scroll drops the *next*
+  message into the previous box at IoU≈1, so a dormant/grace row absorbs it and
+  re-votes the whole line — inheriting an earlier timestamp and inverting output
+  order. The guard rejects an observation whose digit anchor conflicts with
+  *every* text in the row's appearance library while the digit-stripped skeleton
+  still matches (hot rows are exempt: their digit noise belongs to the voter).
 
 ### 5. OCR驱动的时序状态机 / OCR-Driven State Machine
 **无需训练数据** / No training data needed:
@@ -125,16 +150,16 @@ layout detection (no extra CV model needed):
   Residual high-confidence garbled lines are best handled by LLM correction.
 
 ### 8.3 滚动帧抽稀 / Scroll-Frame Thinning
-实测发现: 滚动动画帧的像素差异大(MAE 14~31), 行差分/条带dHash/平移对齐等
+实测发现: 滚动动画帧的像素差异大(MAE 14–31), 行差分/条带dHash/平移对齐等
 **视觉方法都无法识别"内容相同"**(滚动残影使像素真正不同), 只能OCR后才知道。
 因此视觉去重在快速滚动段会逐帧判NEW→逐帧送OCR, 产生大量冗余调用
 (实测268帧OCR中约70%是滚动帧)。
 MCP实测(PP-OCRv6): 同一滚动段内f0039/f0041/f0044三帧OCR结果几乎完全相同
 (均47行、置信度99%), 证实冗余。
-Measured: scroll animation frames differ in pixels (MAE 14~31); visual methods
+Measured: scroll animation frames differ in pixels (MAE 14–31); visual methods
 (row-diff/dHash/shift alignment) cannot detect "same content"; only OCR can.
 PP-OCRv6 spot checks: frames f0039/f0041/f0044 in one scroll segment yield
-nearly identical OCR (47 lines, ~99% confidence).
+nearly identical OCR (47 lines, ≈99% confidence).
 
 解决方案: 预热(校准)完成后, 滚动帧(MAE≥T1)距上次OCR帧不足
 `sampling.scroll_min_interval_seconds`(默认0.12s)则跳过OCR, 静止帧不受影响。
@@ -150,10 +175,10 @@ Measured: OCR calls 268→120 (-55%), tracked lines 133→163 (+23%), no loss
 (recovers account-menu and warning text previously dropped).
 
 ### 8.4 内容指纹OCR复用 / Content-Fingerprint OCR Reuse
-**问题/Problem**: 录屏经视频编码逐帧压缩, 每帧噪声累加(~1 MAE/帧)。即使画面
+**问题/Problem**: 录屏经视频编码逐帧压缩, 每帧噪声累加(≈1 MAE/帧)。即使画面
 内容完全相同(静止等待/回弹), 相隔数帧后行差分/MAE也远超阈值, 像素级视觉去重
 失效——f0304-f0329等多组"内容相同"的帧全部被误判为新内容。
-Per-frame compression noise accumulates (~1 MAE/frame). Even with identical
+Per-frame compression noise accumulates (≈1 MAE/frame). Even with identical
 content (static waits/bounces), row-diff/MAE exceed thresholds a few frames
 apart, breaking pixel-level visual dedup.
 
@@ -227,7 +252,7 @@ Strategy design for rate-limited API (429) and local-OCR throughput. **Not yet i
    / Scroll-rate estimate guides early termination of the middle.
 
 **架构/Architecture (两阶段落地/Two-phase rollout)**:
-- 阶段1 分片并行(低风险): 视频按时间等分k片(边界重叠~1s), 每片独立跑现有
+- 阶段1 分片并行(低风险): 视频按时间等分k片(边界重叠≈1s), 每片独立跑现有
   正向流水线, 共享内容指纹缓存 → 跨片同屏自动去重; k个进程/实例并行。
   Phase 1 (low risk): shard the video, run the existing forward pipeline per
   shard in parallel, share the content-fingerprint cache for cross-shard dedup.
@@ -249,39 +274,156 @@ Strategy design for rate-limited API (429) and local-OCR throughput. **Not yet i
   early termination.
 - 429率 / 墙钟时间 / wall-clock time
 
+### 12. 音频通道(语音消息转写) / Audio Channel (Voice-Message Transcription)
+聊天记录里的**语音消息在屏幕上是没有任何文字的**: 只有一个带波形图的气泡和时长
+标签, OCR 通道读不到内容。音频通道把视频音轨变成"第几条语音说了什么", 再按时间
+锚点插回聊天流水。它与视觉通道**解耦并行**, 不改动既有采样/去重/OCR 流程。
+Voice messages carry no on-screen text — only a waveform bubble plus a duration
+label. The audio channel turns the track into per-message transcripts and
+injects them back by time anchor. It runs decoupled from the visual channel.
+
+```
+视频 ─┬─ 视觉通道: 采样 → OCR → 行跟踪 → 组装 ────────────────┐
+      │                                                       ├→ report_merge → 报告
+      └─ 音频通道: decode → VAD切段 → 并发ASR                 │
+                    + 语音气泡扫描(视觉形状) → VoiceEvent ─────┘
+```
+
+1. **音轨解码与 VAD 切段 / Decode + VAD**(`src/audio/audio_loader.py`, `vad.py`)
+   PyAV 解码音轨 → 16kHz 单声道 float64 PCM。**ASR 服务端不返回时间戳**, 故时间轴
+   完全由客户端切段决定: 自适应能量阈值(能量最低 2% 的均值作噪声基底 × 10, 不硬编码
+   绝对音量) + 进入语音连续 3 帧越阈去抖 + 退出 hangover 拖尾 + 过滤孤立微段 +
+   合并相邻段。numpy 向量化, 确定性。
+   The ASR service returns no timestamps, so the timeline comes entirely from
+   client-side adaptive-energy VAD (noise floor = trimmed-min 2% × 10), with
+   debounce on entry, hangover on exit, micro-segment filtering and merging.
+
+2. **逐段并发 ASR / Concurrent per-segment ASR**(`transcriptor.py`, `asr_client.py`)
+   OpenAI 兼容 `POST {base_url}/audio/transcriptions`(默认 `sensevoice-small`),
+   `concurrency` 路并发; 超过 `max_segment_seconds`(默认 360s)的段硬切细分 ——
+   实测单请求音频 >25MB 会让服务端 CUDA OOM。
+
+3. **轻量语音气泡检测 / Lightweight voice-bubble detection**
+   (`src/visual/voice_bubble_detector.py`) 纯启发式、CPU-friendly、无深度学习依赖:
+   - **背景自适应掩码(主力, 颜色无关)**: 估计背景(全局中位数 + 逐行中位数)后按色差
+     经 Otsu 切前景 → 对图片壁纸与任意气泡配色(非绿/非白)都成立;
+   - 颜色域掩码(绿/白)只作**辅助加分**, 不再是存在性或方向的必要条件;
+   - 框内提取"墨水掩码", 用**波形 vs 文字**的形态差异算 `voice_score`(波形 = 底部
+     对齐的细竖条、横向窄带 → 高分; 汉字多行笔画 → <0.5);
+   - **方向以水平位置为主判据**: 气泡中心 x 在会话区中线右侧 → `[发]`, 左侧 → `[收]`;
+     仅当落在中线死区时才回退用颜色。另用**宽/高双判据尺寸门**滤掉窄条装饰。
+
+4. **气泡事件归并 / Bubble-event merging**(`voice_bubble_scanner.py`)
+   用 cv2 **重开视频做独立的第二遍扫描**(默认每 0.2s 抽样一帧), 跨帧归并出
+   `VoiceEvent`(出现时刻 / 时长 / 方向), 作为把音频配对回聊天记录的时间锚点。
+   匹配走两级: 静止/小抖动用 IoU≥0.35; 滚动时先做**全局平移估计**(Δy 聚类投票,
+   ≥3 票)与**相位相关静止帧判定**, 再走平移兜底(宽高容差 0.25、中心 x 容差 0.15、
+   纵向位移上限 2.5 倍气泡高)。位移上限同时挡住"自身气泡已滚出屏幕的陈旧状态"去认领
+   屏幕另一端的新气泡(否则新气泡不发事件, 其音频会配到旧气泡的收发方向上)。
+   同一采样帧内的多个候选**必然是不同物理气泡**, 不按几何签名合并。
+
+5. **OCR 时长标签双源确认 / Duration labels from the OCR cache**
+   (`ocr_voice_scanner.py`)
+   不再独立计数 —— 全局 `mm:ss` 正则会把界面时钟/进度数字误判为语音气泡(曾在含实时
+   时钟的录屏上错误写出 88 条, 真实仅 25 条); 改为基于流水线**已落盘的 OCR 缓存**
+   输出每个候选时长标签的原始观测(时间/文本/框), 只作视觉气泡**框内**的佐证。
+   两种真实写法都认: ① `mm:ss`; ② **不带冒号的 `N"`**(实测主流微信渲染就是这种,
+   引号还可能被 OCR 读成 `”`/`’`/`′`/`″`, 气泡被屏幕边缘裁切时会读成 `…4"`)。
+   领域约束: 秒位 ∈ [1,59] 且总时长 ≤60s(微信单条语音上限), 直接剔除时钟数字 ——
+   实测 907 个 `mm:ss` 命中里有 468 个 >60s。
+
+6. **逐条切音与转写 / Per-voice slicing**(`voice_extractor.py`)
+   发声窗 = `[气泡timestamp, timestamp + 语音时长]`(时长优先取 OCR 标签; 缺失时
+   回退气泡停留时长, 但后者可能含非语音留白)。逐条存 WAV 到 `output/voices/` 并
+   逐条转写, 为下游 NLP / 声纹建档提供干净输入。
+
+7. **合并注入与跨路去重 / Merge, inject, cross-path dedup**(`report_merge.py`)
+   - `result["audio"]`: 完整逐段转写(视频时间轴锚点);
+   - `result["voice_events"]`: 视觉气泡 × 音频段按时间就近配对(`match_gap_s`),
+     未配对的(静音/被提前滚走)保留空文本;
+   - 注入聊天段落 `- +Ns [语音][发/收] ：text`, **按转写段逐句注入**而非把整簇拼成
+     一行 —— 一个气泡的时间窗常横跨相邻若干条消息, 拼接会把多条粘成一条;
+   - 注入前做**视觉 × 音频跨路去重**(屏幕上已有同一句时不再注入): 归一化相似度
+     ≥0.60 且长度比 ≥0.6, 并附两道保护 —— *共享前缀 + 尾段悬殊* 判为两条不同消息
+     (只是开头相同); *数字锚点子序列* 放宽以容忍 ASR 多念/漏念一位数字(真·不同
+     数字如 8812/8816 是替换关系, 不放行)。
+
+8. **Web 端逐条审听 / Per-voice playback in the Web UI**
+   (`web/backend/services/voice_audio.py`, `web/frontend/src/components/AudioInspector.vue`)
+   提取完成后按 `voice_events` 切出逐条 wav, 把相对 URL 回填进
+   `voice_events.audio_url`, 经 `GET /api/sessions/{sid}/voices/{name}` 提供,
+   前端可直接定位并审听每条语音、逐条核对转写。
+
+**实测 / Measured**
+- 语音为主录屏(20 条语音): 收发方向 **20/20** 与 GT 逐条一致;
+- 14 条实录版录屏: 音频通道 **6/6 = 100%**, 语音方向 **6/6**; 整体严格一对一
+  F1=0.706、方向宏 F1=0.916(`tools/eval_voice_gt.py`, GT 见 `gt/`)。
+
 ## 项目结构 / Project Structure
 
 ```
-├── main.py                    # 主入口 / Main entry
-├── config.yaml                # 配置文件 / Configuration
-├── requirements.txt           # 依赖 / Dependencies
+├── main.py                        # 主入口(CLI) / Main entry
+├── config.example.yaml            # 配置模板 / Config template
+├── config.yaml                    # 实际配置(含密钥, 已 gitignore) / Real config (gitignored)
+├── requirements.txt               # 依赖 / Dependencies
 ├── src/
-│   ├── config_loader.py       # 配置加载 / Config loader
-│   ├── data_types.py          # 数据类型 / Data types
-│   ├── pipeline.py            # 并行流水线编排 / Parallel pipeline orchestrator
-│   ├── frame_sampler.py       # 自适应抽帧 / Adaptive sampling
-│   ├── roi_manager.py         # ROI管理 / ROI manager
-│   ├── blur_detector.py       # 模糊检测 / Blur detection
-│   ├── visual_dedup.py        # 视觉去重 / Visual dedup
-│   ├── ocr_client.py          # OCR客户端 / OCR client
-│   ├── text_tracker.py        # 文本跟踪 / Text tracker
-│   ├── state_machine.py       # 状态机 / State machine
-│   ├── semantic_dedup.py      # 语义去重(LLM仲裁+OCR纠错) / Semantic dedup
-│   ├── content_assembler.py   # 内容组装 / Content assembler
-│   ├── llm_client.py          # LLM客户端(可选) / LLM client (optional)
+│   ├── pipeline.py                # 并行流水线编排 / Parallel pipeline orchestrator
+│   ├── config_loader.py           # 配置加载 / Config loader
+│   ├── data_types.py              # 数据类型 / Data types
+│   ├── frame_sampler.py           # 自适应抽帧 + 滚动帧抽稀 / Adaptive sampling + scroll thinning
+│   ├── frame_value.py             # 帧价值估计(连续分数替代状态硬分类) / Frame-value scoring
+│   ├── roi_manager.py             # ROI 管理 / ROI manager
+│   ├── blur_detector.py           # 模糊检测 / Blur detection
+│   ├── visual_dedup.py            # 视觉去重 / Visual dedup
+│   ├── row_fingerprint.py         # RFSA 行指纹序列对齐去重 / Row-fingerprint sequence alignment
+│   ├── ocr_client.py              # OCR 客户端(api/local/mock) / OCR client
+│   ├── message_bubble_tracker.py  # 空间感知文本行跟踪 + 跨帧投票 / Text-line tracker + voting
+│   ├── bubble_merger.py           # 气泡内折行合并/系统提示过滤/残片吸收 / Wrap merging & scrap absorption
+│   ├── screenshot_filter.py       # 截图消息整簇折叠 / Screenshot-message cluster folding
+│   ├── state_machine.py           # OCR 驱动状态机 / OCR-driven state machine
+│   ├── semantic_dedup.py          # 语义去重(LLM 仲裁 + OCR 纠错) / Semantic dedup
+│   ├── content_assembler.py       # 内容组装 / Content assembler
+│   ├── report_render.py           # md/html 报告渲染 / Report rendering
+│   ├── llm_client.py              # LLM 客户端(可选) / LLM client (optional)
+│   ├── audio/                     # ★ 音频通道 / Audio channel (§12)
+│   │   ├── audio_loader.py        #   音轨解码/切段(PyAV) / Track decode & slicing
+│   │   ├── vad.py                 #   自适应能量 VAD / Adaptive energy VAD
+│   │   ├── asr_client.py          #   ASR HTTP 客户端 / ASR client
+│   │   ├── transcriptor.py        #   逐段并发转写编排 / Concurrent transcription
+│   │   ├── voice_bubble_scanner.py#   语音气泡事件归并 / Bubble-event merging
+│   │   ├── ocr_voice_scanner.py   #   OCR 时长标签佐证 / Duration-label evidence
+│   │   ├── voice_extractor.py     #   逐条切音 + 转写 / Per-voice extraction
+│   │   ├── report_merge.py        #   视觉×音频合并注入 / Merge & inject
+│   │   └── data_types.py          #   VoiceEvent / VoiceUtterance
+│   ├── visual/                    # 纯 CV 视觉算子 / Pure-CV operators
+│   │   ├── voice_bubble_detector.py#  轻量语音气泡检测 / Voice-bubble detection
+│   │   ├── chat_scene.py          #   聊天界面判定 / Chat-scene detection
+│   │   └── scroll_motion.py       #   帧级滚动位移估计 / Scroll-offset estimation
 │   └── utils/
-│       ├── image_utils.py     # 图像工具 / Image utils
-│       ├── text_utils.py      # 文本工具 / Text utils
-│       └── behavior_logger.py # 行为日志 / Behavior logger
-├── tests/
-│   └── smoke_test.py          # 冒烟测试 / Smoke test
-└── output/                    # 输出目录 / Output directory
+│       ├── image_utils.py         # 图像工具 / Image utils
+│       ├── motion_utils.py        # 相位相关位移/梯度方向熵 / Phase correlation & GDE
+│       ├── text_utils.py          # 文本工具(相似度/IoU/数字锚点) / Text utils (incl. digit anchor)
+│       ├── text_consensus.py      # 字符级多观测共识投票 / Char-level consensus voting
+│       └── behavior_logger.py     # 行为日志(jsonl) / Behavior logger
+├── web/                           # FastAPI + Vue3 可视化 / Web UI
+│   ├── run.py                     #   一键启动 / One-command launcher
+│   ├── backend/                   #   会话管理 + 提取服务 + 逐条语音审听
+│   └── frontend/                  #   Vue3 前端(含 AudioInspector)
+├── tools/                         # 评测与运维脚本 / Eval & ops scripts
+│   ├── eval_voice_gt.py           #   语音 GT 评测(P/R/F1、收发方向) / Voice-GT eval
+│   ├── eval_synthetic.py          #   合成录屏批量评测 / Synthetic batch eval
+│   └── eval_ocr_consensus.py      #   OCR 共识投票评测 / Consensus eval
+├── scripts/                       # 内容保全/前后对比等辅助脚本 / Recall & diff helpers
+├── gt/                            # 人工标注 GT(评测依据) / Hand-labeled ground truth
+├── tests/                         # 单元与冒烟测试 / Unit & smoke tests
+└── output/                        # 输出目录(已 gitignore) / Output (gitignored)
 ```
 
 ## 安装 / Installation
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt          # 含音频通道所需的 av(PyAV)
+pip install -r web/backend/requirements.txt   # 仅 Web 可视化需要(FastAPI/uvicorn)
 ```
 
 PaddleOCR(本地模式, 可选) / PaddleOCR (local mode, optional):
@@ -294,6 +436,22 @@ pip install paddlepaddle paddleocr
 ### 基本用法 / Basic Usage
 ```bash
 python main.py --video recording.mp4
+```
+
+### Web 可视化(推荐) / Web UI (recommended)
+FastAPI + Vue3, 上传录屏后在浏览器里看进度、聊天段落、以及**逐条语音的审听与转写核对**:
+```bash
+python web/run.py --port 8000 --host 127.0.0.1
+# Windows 也可直接双击 `web服务前后端一键启动脚本.bat`(停止: `web服务一键停止脚本.bat`)
+```
+打开 `http://127.0.0.1:8000`。首次使用需先构建前端(`web/frontend`: `npm i && npm run build`)。
+
+### 评测 / Evaluation
+以人工标注 GT(`gt/`)为准, 输出严格一对一 P/R/F1、收发方向混淆矩阵与漏检/冗余诊断:
+```bash
+python tools/eval_voice_gt.py <视频名> --gt gt/聊天14条_实录版.md \
+    --out-json output/extracted_content_<视频名>.json
+python tools/eval_synthetic.py          # 合成录屏批量评测
 ```
 
 ### 冒烟测试 / Smoke Test
@@ -344,6 +502,37 @@ output:
     roi_width: 0         # 屏幕宽度(0=由流水线按ROI自动传入)
     center_margin: 20    # 居中地带(px), 两侧留白差小于该值则不标记
     time_fallback: true  # 无时间戳时用播放秒数(+Ns)兜底
+```
+
+### 音频通道配置 / Audio Channel Config (§12)
+```yaml
+audio:
+  enabled: true
+  base_url: "http://your-asr-server:port/v1"   # OpenAI 兼容 ASR 服务
+  api_key: "your_api_key_here"
+  model: "sensevoice-small"
+  sample_rate: 16000
+  max_segment_seconds: 360      # 超长段硬切上限(防服务端 OOM)
+  concurrency: 2                # ASR 并发路数
+  bubble_enabled: true          # 语音气泡视觉检测
+  bubble_threshold: 0.55        # voice_score 门限
+  bubble_sample_interval_s: 0.2 # 第二遍扫描抽样间隔
+  bubble_merge_window_s: 1.2    # 同一气泡跨帧归并窗
+  match_gap_s: 1.5              # 视觉气泡 × 音频段 就近配对的最大时间差
+  inject_chat: true             # 是否把语音内容注入聊天段落
+```
+
+### 文本跟踪配置(节选) / Text-Tracker Config (excerpt)
+```yaml
+text_tracker:
+  iou_threshold: 0.4              # bbox IoU 匹配阈值
+  text_sim_threshold: 0.80        # 文本相似度匹配阈值
+  iou_strong_threshold: 0.6       # "同一框"判定; 命中后文本门限放宽到下面这项
+  text_sim_strong_threshold: 0.50 # 同一框内的放宽文本门限(兜 OCR 噪声)
+  dormant_rematch_frames: 10      # 休眠超过该帧数的行需强空间证据才可吸收观测
+  template_digit_guard_sim: 0.90  # 数字锚点守卫(§4); 置 0 关闭
+  reattach_grace_seconds: 3.0     # 过期行重挂宽限, 消除 ID 切换
+  adjacent_gap_ratio: 1.0         # 相邻行排他仲裁; 置 0 关闭
 ```
 
 ## LLM增强说明 / LLM Enhancement

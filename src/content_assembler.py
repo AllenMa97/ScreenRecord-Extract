@@ -16,7 +16,9 @@ import os
 from collections import OrderedDict
 from typing import List
 
-from src.bubble_merger import classify_side, classify_side_line, merge_wrapped_lines
+from src.bubble_merger import (absorb_wrap_tail_leftovers, classify_side,
+                               classify_side_line, drop_system_prompts,
+                               merge_wrapped_lines)
 from src.data_types import TrackedLine, TextLine
 from src.llm_client import LlmClient
 from src.screenshot_filter import (collapse_screenshot_clusters,
@@ -45,6 +47,10 @@ class ContentAssembler:
         """设置ROI宽度(聊天收发定位用)"""
         self._roi_width = int(width or 0)
         self._llm.set_roi_width(self._roi_width)
+
+    def set_roi_height(self, height: int) -> None:
+        """设置ROI高度(聊天时间戳行的顶部条带判定用)"""
+        self._llm.set_roi_height(int(height or 0))
 
     def set_frame_provider(self, provider) -> None:
         """设置按帧序号(1基)取ROI帧的回调, 供气泡像素验证/颜色判定使用。
@@ -86,6 +92,10 @@ class ContentAssembler:
         """从文本跟踪器收集所有跟踪行"""
         self._all_tracked = tracker.get_all_tracked()
 
+    def get_tracked_lines(self) -> List[TrackedLine]:
+        """返回当前(已做气泡合并/系统提示过滤的)跟踪行, 供音频注入排序使用。"""
+        return list(self._all_tracked)
+
     def assemble(self) -> dict:
         """
         组装最终结果。
@@ -97,21 +107,44 @@ class ContentAssembler:
                          f"开始组装: {len(self._all_tracked)}跟踪行, "
                          f"{len(self._all_new_lines)}新行, {len(self._gaps)}缺口")
 
+        # 居中系统提示过滤(气泡合并前, 最早入口): 时间条/撤回提示/"以下为新消息"/
+        # "你已添加好友"等居中系统提示不是聊天消息。提前剔除, 避免它们污染后续
+        # 气泡合并的收发方向判定与滚动去重(LLM/降级两条组装路径共用本入口)。
+        # HH:MM 时间分隔条由 STAMP_RE 另行处理, 不受影响。
+        # / Drop centered system prompts first so they never pollute bubble merge,
+        # side detection or de-duplication (shared entry of both assembly paths).
+        self._all_tracked, sys_dropped = drop_system_prompts(
+            self._all_tracked, self._roi_width, self._center_margin,
+            self._chat_enabled)
+        if sys_dropped:
+            self._logger.log("content_assembler", "system_prompt_filter",
+                             f"居中系统提示过滤: 剔除{sys_dropped}条非消息文本",
+                             extra={"dropped": sys_dropped})
+
         # 气泡内换行合并(CV侧几何方案, 先于LLM): 一条长消息被界面自动换行后,
         # OCR返回多行, 若不合并会被拆成多条语义不完整的结果并带偏后续消息的
         # 合并/时间/归属。几何合并独立于LLM, 两条组装路径统一受益。
+        side_fn = lambda line: classify_side_line(   # noqa: E731
+            line, self._roi_width, self._center_margin,
+            self._chat_enabled, self._frame_provider)
         merged, merged_count = merge_wrapped_lines(
-            self._all_tracked,
-            lambda line: classify_side_line(line, self._roi_width,
-                                            self._center_margin,
-                                            self._chat_enabled,
-                                            self._frame_provider),
-            self._frame_provider)
+            self._all_tracked, side_fn, self._frame_provider)
         if merged_count:
             self._logger.log("content_assembler", "wrapped_merge",
                              f"气泡内换行合并: {merged_count}处碎片合并为完整消息",
                              extra={"merged": merged_count})
         self._all_tracked = merged
+
+        # 换行尾片段归属(合并之后): 滚动使长消息的父行滚出画面、只剩最后一行
+        # 残留在顶部边缘时, 该尾行会被OCR重新识别成独立文本行, 直接输出就会把
+        # 同一条消息的尾巴重复输出一次。此处按"真后缀 + 时序 + 同向"把这类尾
+        # 片段归回父消息(即丢弃), 见 absorb_wrap_tail_leftovers。
+        self._all_tracked, tail_dropped = absorb_wrap_tail_leftovers(
+            self._all_tracked, side_fn)
+        if tail_dropped:
+            self._logger.log("content_assembler", "wrap_tail_absorb",
+                             f"换行尾片段归属: {tail_dropped}条尾部残片归回父消息",
+                             extra={"absorbed": tail_dropped})
 
         # 截图消息过滤(几何合并后、LLM增强前): 收发双方发送的 App 截图内部
         # 文字会被OCR识别成聊天行, 检测到截图簇后整簇折叠为 [图片消息] 占位,
@@ -132,6 +165,17 @@ class ContentAssembler:
                                     "rows": shot_count})
 
         # 使用LLM增强(如果启用)或基础组装
+        # 诊断: 落盘跟踪行明细(文本/首末时间/观测次数), 供分析"同一消息被重复
+        # 输出成多行"与"噪声行"的成因(行为日志而非黑盒LLM thinking)。
+        self._logger.log(
+            "content_assembler", "tracked_dump",
+            f"跟踪行明细 {len(self._all_tracked)}条",
+            extra={"lines": [
+                {"text": ln.text,
+                 "t0": round(float(ln.first_timestamp), 2),
+                 "t1": round(float(ln.last_timestamp), 2),
+                 "obs": ln.observation_count()}
+                for ln in self._all_tracked]})
         result = self._llm.enhance_result(self._all_tracked, self._gaps)
 
         # 添加统计信息
