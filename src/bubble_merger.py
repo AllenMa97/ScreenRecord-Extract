@@ -335,7 +335,9 @@ def classify_side_line(line: TrackedLine, roi_width: int,
 # 判据(保守, 宁可不滤也不错滤):
 #   1. 聊天界面开启(否则无收发方向可言, 不做过滤);
 #   2. 水平居中(左右留白接近)且几何法判不出方向(classify_side == "", 即不贴左/右);
-#   3. 文本命中已知系统模式, 或文本足够短(<= _SYS_MAX_LEN 字)。
+#   3. 文本命中已知系统模式, 或"文本足够短(<= _SYS_MAX_LEN 字)且行足够窄
+#      (< _SYS_MAX_WIDTH_RATIO × ROI 宽)"。窄行限定是必需的: 宽气泡的折行会铺满
+#      ROI, 左右留白几乎相等 → 判不出方向且中心贴 ROI 中心, 会把正文当系统提示删掉。
 # 正常聊天消息都在左/右气泡里(有明确方向), 因此不会被误杀; HH:MM 时间分隔条由
 # STAMP_RE 单独处理(消息时间关联需要它们), 不在此丢弃。
 # / Real recordings inevitably interleave centered system prompts (small, gray, no
@@ -347,6 +349,8 @@ def classify_side_line(line: TrackedLine, roi_width: int,
 # handled by STAMP_RE (needed for message timestamps) and never dropped here.
 _SYS_CENTER_TOL = 0.08      # 居中容差(ROI宽度比例, 与时间分隔条同口径)
 _SYS_MAX_LEN = 20           # "无方向 + 居中"时的短文本上限(字符数)
+_SYS_MAX_WIDTH_RATIO = 0.45  # 短文本捷径只认"窄行": 行宽占 ROI 宽度达到此比例
+                            # 即判为气泡折行(见 is_centered_system_prompt 说明)
 # 已知系统提示模式(保守列举, 只收录明确的系统提示措辞)
 SYSTEM_PROMPT_RE = re.compile(
     r"撤回"                     # 对方撤回了一条消息 / 你撤回了一条消息
@@ -355,6 +359,7 @@ SYSTEM_PROMPT_RE = re.compile(
     r"|已添加.*好友"
     r"|以上是打招呼"
     r"|开启了朋友验证"
+    r"|通过了.*验证"            # 对方通过了你的朋友验证请求
     r"|对方正在输入"
 )
 
@@ -377,8 +382,21 @@ def is_centered_system_prompt(text: str, bbox, roi_width: int,
     判据(全部满足):
       1. 聊天界面开启;
       2. 水平居中且几何法判不出收发方向(classify_side=="", 即不贴左/右);
-      3. 文本命中已知系统模式(含"撤回"/"以下为新消息"/"你已添加"等), 或足够短。
+      3. 文本命中已知系统模式(含"撤回"/"以下为新消息"/"你已添加"等),
+         或"足够短 **且** 足够窄"(短文本捷径)。
     HH:MM 时间分隔条由 STAMP_RE 处理, 这里一律返回 False(不得误丢时间条)。
+
+    为什么短文本捷径还要看行宽: **宽气泡的折行会横向铺满 ROI**, 其左右留白差可
+    小到几个像素 → classify_side 判不出方向, 水平中心又天然贴着 ROI 中心 → 前两条
+    判据全部满足, 单靠"居中 + 短"就把正文折行当系统提示删掉了(实测 video4 GT#12:
+    头/中折行宽占比 0.542/0.528, 左右留白 129/135, 13/15 字, 整条长消息只剩尾行
+    幸存)。真居中系统提示是**窄**灰字(如"星期一"占比约 0.13), 不受影响; 措辞明确
+    的长系统提示走 SYSTEM_PROMPT_RE, 也不受行宽守卫影响。
+    / Wide bubbles wrap to lines that span most of the ROI, so their left/right
+    gaps nearly match: side detection yields "" and the horizontal center lands on
+    the ROI center. "Centered AND short" alone therefore deleted real message
+    bodies. The short-text shortcut now additionally requires a narrow line;
+    known system wordings still match via SYSTEM_PROMPT_RE regardless of width.
     """
     if not chat_enabled or roi_width <= 0:
         return False
@@ -389,7 +407,12 @@ def is_centered_system_prompt(text: str, bbox, roi_width: int,
         return False            # 有明确收发方向 → 正常消息, 不滤
     if not _is_horizontally_centered(bbox, roi_width):
         return False
-    return bool(SYSTEM_PROMPT_RE.search(t)) or len(t) <= _SYS_MAX_LEN
+    if SYSTEM_PROMPT_RE.search(t):
+        return True             # 措辞明确的系统提示: 与行宽无关, 直接剔除
+    x1, _, x2, _ = bbox
+    if (x2 - x1) / float(roi_width) >= _SYS_MAX_WIDTH_RATIO:
+        return False            # 宽行 = 气泡折行, 不是居中系统提示
+    return len(t) <= _SYS_MAX_LEN
 
 
 def drop_system_prompts(lines: List[TrackedLine], roi_width: int,
