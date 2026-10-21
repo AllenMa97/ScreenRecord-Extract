@@ -142,7 +142,8 @@ def main():
     # 当前帧 cur: 3行是回看(10,11,12已在库) + 1行全新(20)
     cur5 = [content(10), content(11), content(12), content(20)]
     # 假设相对窗口这4行都被判为"新"(滚动滚出窗口后, 窗口无法匹配)
-    kept, dropped = a5._filter_seen_rows(cur5, [0, 1, 2, 3])
+    # inks 取 0.5(远高于 rf_degenerate_ink 默认 0.01) → 允许模糊近邻匹配
+    kept, dropped = a5._filter_seen_rows(cur5, [0.5] * 4, [0, 1, 2, 3])
     check("回看3行被剔除、仅新行保留",
           kept == [3] and dropped == 3,
           f"got kept={kept} dropped={dropped}")
@@ -152,7 +153,7 @@ def main():
     a6 = RowFingerprintAligner(cfg, NullLogger())
     a6._commit_subsequences([content(31), content(32), content(33)])
     cur6 = [content(33), content(31), content(32)]   # 打乱顺位滚动回来
-    kept, dropped = a6._filter_seen_rows(cur6, [0, 1, 2])
+    kept, dropped = a6._filter_seen_rows(cur6, [0.5] * 3, [0, 1, 2])
     check("历史屏回看不产生新行", kept == [] and dropped == 3,
           f"got kept={kept} dropped={dropped}")
 
@@ -163,7 +164,7 @@ def main():
     a7._commit_subsequences([ctx(1, 41)])
     # 回看时同一内容41出现在不同位移idx=7(低字节变化, 高32位内容指纹不变)
     cur7 = [ctx(7, 41)]
-    seen = a7._row_seen_in_lib(cur7[0])
+    seen = a7._row_seen_in_lib(cur7[0], 0.5)
     check("同内容不同位移仍判已见(位移免疫)", seen is True,
           f"got seen={seen}")
 
