@@ -107,7 +107,14 @@ def _is_same_message(a: str, b: str) -> bool:
     short, long = (ka, kb) if len(ka) <= len(kb) else (kb, ka)
     if len(short) < _VARIANT_MIN_LEN or len(short) < _VARIANT_MIN_RATIO * len(long):
         return False
-    return text_similarity(short, long[:len(short)]) >= _VARIANT_PREFIX_SIM
+    # 后缀方向同理: 滚动**回看**时长消息已完整输出过一次, 之后画面回滚只露出尾部,
+    # 尾片段又被读成一条独立行(实测 video4 GT#12: 完整行已在 +29s 输出, 尾片段
+    # "明是不是漏了几个？…原始设计稿" 在 +35s 再输出一次)。前缀口径覆盖不到它,
+    # 因为它是父消息的**结尾**而非开头。
+    # / Suffixes too: after scrolling back only the tail of an already-emitted long
+    # message stays visible and is read as a brand-new line.
+    return (text_similarity(short, long[:len(short)]) >= _VARIANT_PREFIX_SIM
+            or text_similarity(short, long[-len(short):]) >= _VARIANT_PREFIX_SIM)
 
 
 # 聊天时间戳行(时间分隔条)有效性判定:

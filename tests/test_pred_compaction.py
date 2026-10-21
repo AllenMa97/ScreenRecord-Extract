@@ -47,6 +47,9 @@ FULL_B = ("有的，我导出成 incident-20261016-0042.Ic，里面能看到线�
 FULL_C = ("有的，我导出成 incident-20261016-0042.lc，里面能看到线程池被打满之后"
           "重试队列一直，最后把连接池的句柄耗尽了，这块你重点看下超时和重试配置")
 TRUNC = "有的，我导出成 incident-20261016-0042.Ic"
+# video4 GT#12 实测: 长消息完整读法 vs 滚动回看时只剩尾部的读法(真后缀)
+FULL_12 = "上次那份接口文档里，字段说明是不是漏了几个？...麻烦你抽空核对一下原始设计稿"
+TAIL_12 = "明是不是漏了几个？...麻烦你抽空核对一下原始设计稿"
 
 
 def test_same_message():
@@ -62,11 +65,17 @@ def test_same_message():
     chk(_is_same_message(FULL_A, FULL_B), "OCR 错字 .Ig/.Ic → 同一条")
     chk(_is_same_message(FULL_B, FULL_C), "OCR 错字 .Ic/.lc → 同一条")
     chk(_is_same_message(TRUNC, FULL_B), "滚动截断读法(前缀) → 同一条")
+    chk(_is_same_message(TAIL_12, FULL_12), "滚动回看读法(后缀) → 同一条")
     chk(_is_same_message("abc", "abc"), "完全相同 → 同一条")
     # 反例
     chk(not _is_same_message("您的快递8812已到驿站，请凭取件码签收",
                              "您的快递8816已到驿站，请凭取件码签收"),
         "仅数字不同(8812/8816) → 必须分开")
+    chk(not _is_same_message("刚核对过了，订单SN0014已确认收款",
+                             "订单SN0010已确认收款"),
+        "后缀同形但数字锚点不同(SN0014/SN0010) → 必须分开")
+    chk(not _is_same_message("我三点前弄完", "明白了，我三点前弄完"),
+        "短回复恰为长消息后缀(不足8字) → 必须分开")
     chk(not _is_same_message("你的快递8814也到了，我顺手帮你带上来",
                              "你的快递8818也到了，我顺手帮你带上来"),
         "仅数字不同(8814/8818) → 必须分开")
